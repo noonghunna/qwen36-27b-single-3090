@@ -210,19 +210,26 @@ The MTP draft head's attention computation interacts badly with TurboQuant's KV 
 
 ### Pick a variant based on what you need
 
-All three benched on a single RTX 3090 at 230W cap, vLLM image pinned to the tested digest, 3× warmup + 3× narrative (1000 tok) + 2× code (800 tok) runs.
+All four benched on a single RTX 3090 at 230W cap, vLLM image pinned to the tested digest, 3× warmup + 3× narrative (1000 tok) + 2× code (800 tok) runs.
 
-| If you need... | Use | Ctx | Narr TPS | Code TPS | Tools | VRAM |
+| If you need... | Use | Ctx | Narr TPS | Code TPS | Tools | Vision |
 |---|---|---|---|---|---|---|
-| **Max context + vision, no tools** (the article's headline) | `docker compose up -d` (default `docker-compose.yml`) | **125K** | **91.9** | **94.6** (peak 95.9) | ❌ | 22.0 GB |
-| **Tool calling + reasonable speed** | `docker compose -f docker-compose.tools.yml up -d` | 20K | 65.9 | 84.4 (peak 85.2) | ✅ | 22.8 GB |
-| **Tool calling + max context (slower)** | Copy `docker-compose.tools.yml`, set `--kv-cache-dtype turboquant_3bit_nc`, set `--max-model-len 125000`, remove the `--speculative-config` line | 125K | 39.8 | 39.7 | ✅ | 22.0 GB |
+| **Max context + vision, no tools** (the article's headline) | `docker compose up -d` (default `docker-compose.yml`) | **125K** | **91.9** | **94.6** (peak 95.9) | ❌ | ✅ |
+| **Tools + vision** | `docker compose -f docker-compose.tools.yml up -d` | 20K | 65.9 | 84.4 (peak 85.2) | ✅ | ✅ |
+| **Tools + long-ctx, text-only** ⭐ (new) | `docker compose -f docker-compose.tools-text.yml up -d` | **75K** | 65.2 | 83.8 (peak 85.0) | ✅ | ❌ |
+| **Tools + max context (slower, keeps vision)** | Copy `docker-compose.tools.yml`, set `--kv-cache-dtype turboquant_3bit_nc`, set `--max-model-len 125000`, remove the `--speculative-config` line | 125K | 39.8 | 39.7 | ✅ | ✅ |
 
-**Interpreting the code/narr split:** configs with MTP spec-decode produce faster code than narrative (code is more predictable → higher MTP accept → more tokens per verify step). Without MTP (config 3), the two converge around 40 TPS because decode is no longer draft-accelerated.
+**Quick picker:**
+- Need vision + tools? → `tools.yml` (20K)
+- Need tools, no vision? → `tools-text.yml` (75K, same speed)
+- Need everything including 125K? → documented no-MTP workaround (~40 TPS)
+- No tools, want headline numbers? → default (125K, 92/95)
+
+**Interpreting the code/narr split:** configs with MTP spec-decode produce faster code than narrative (code is more predictable → higher MTP accept → more tokens per verify step). Without MTP, the two converge around 40 TPS because decode is no longer draft-accelerated.
 
 Only one container can bind to port 8020 — `docker compose down` before switching.
 
-Measured 2026-04-24 on `vllm/vllm-openai@sha256:9bba4628a3b9...` (digest pinned in both compose files).
+Measured 2026-04-24 on `vllm/vllm-openai@sha256:9bba4628a3b9...` (digest pinned in all compose files).
 
 ### Upstream-bug potential
 

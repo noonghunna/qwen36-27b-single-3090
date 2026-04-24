@@ -1,0 +1,107 @@
+# ===========================================================================
+# Text-only tools variant — use this if you need tool calling AND more than
+# 20K context, but don't need vision/image inputs.
+#
+# Compared to docker-compose.tools.yml (the with-vision variant), this drops
+# the MoonViT encoder (saves ~0.86 GB VRAM) and spends that budget on KV
+# cache → context grows from 20K to 75K with the same throughput.
+#
+# Variant matrix:
+#
+#   Variant              Max ctx   Narr TPS   Code TPS   Tools   Vision
+#   ─────────────────────────────────────────────────────────────────────
+#   default               125K       91.9       94.6       ❌       ✅
+#   tools (with vision)    20K       65.9       84.4       ✅       ✅
+#   tools-text (this)      75K       65.2       83.8       ✅       ❌
+#   no-MTP (125K+tools)   125K       39.8       39.7       ✅       ✅
+#
+# If you need ALL of (tools, max ctx, vision) → no-MTP path; expect ~40 TPS.
+#
+# Run with:
+#   cd compose
+#   docker compose -f docker-compose.tools-text.yml up -d
+# ===========================================================================
+services:
+  vllm-qwen36-27b:
+    image: vllm/vllm-openai@sha256:9bba4628a3b943e0dd33caefb94b811569ba1e97bdf23bee19a265c31b947ccb
+    container_name: vllm-qwen36-27b
+    restart: "no"
+    ports:
+      - "8020:8000"
+    volumes:
+      - ${MODEL_DIR:-../models}:/root/.cache/huggingface
+      - ../patches/genesis/patch_genesis_unified.py:/patches/patch_genesis_unified.py:ro
+      - ../patches/patch_tolist_cudagraph.py:/patches/patch_tolist_cudagraph.py:ro
+    environment:
+      # - CUDA_VISIBLE_DEVICES=0
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      - VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - NCCL_CUMEM_ENABLE=0
+      - NCCL_P2P_DISABLE=1
+      - VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1
+      - VLLM_NO_USAGE_STATS=1
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512
+      - VLLM_FLOAT32_MATMUL_PRECISION=high
+      - VLLM_USE_FLASHINFER_SAMPLER=1
+      - OMP_NUM_THREADS=1
+      - CUDA_DEVICE_MAX_CONNECTIONS=8
+      - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+      - VLLM_MARLIN_USE_ATOMIC_ADD=1
+    shm_size: "16gb"
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+        pip install xxhash -q
+        python3 /patches/patch_genesis_unified.py
+        python3 /patches/patch_tolist_cudagraph.py
+        exec vllm serve "$@"
+      - --
+    command:
+      - --model
+      - /root/.cache/huggingface/qwen3.6-27b-autoround-int4
+      - --served-model-name
+      - qwen3.6-27b-autoround
+      - --quantization
+      - auto_round
+      - --dtype
+      - float16
+      - --tensor-parallel-size
+      - "1"
+      - --max-model-len
+      - "75000"
+      - --gpu-memory-utilization
+      - "0.97"
+      - --max-num-seqs
+      - "1"
+      - --max-num-batched-tokens
+      - "2048"
+      # fp8_e5m2 (not turboquant) — required for tool calls to work with MTP.
+      - --kv-cache-dtype
+      - fp8_e5m2
+      # Dropping the MoonViT vision tower frees ~0.86 GB for KV cache,
+      # pushing max_model_len from 20K → 75K vs docker-compose.tools.yml.
+      - --language-model-only
+      - --trust-remote-code
+      - --reasoning-parser
+      - qwen3
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+      - --enable-prefix-caching
+      - --enable-chunked-prefill
+      - --speculative-config
+      - '{"method":"mtp","num_speculative_tokens":3}'
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
