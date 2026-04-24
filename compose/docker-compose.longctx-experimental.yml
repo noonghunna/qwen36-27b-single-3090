@@ -9,8 +9,10 @@
 # It benchmarks faster than the default (92/95 TPS vs 66/84 TPS) because MTP
 # acceptance is high on simple narrative and code prompts.
 #
-# BUT — broader functional testing (scripts/verify-full.sh) revealed that
-# MTP × ANY TurboQuant KV preset produces degenerate token loops on:
+# BUT — broader functional testing (scripts/verify-full.sh + two follow-up
+# probes on a non-hybrid dense model) revealed that TurboQuant KV combined
+# with ANY speculative decoding method — MTP *or* ngram — produces degenerate
+# token loops on:
 #
 #   1. Tool-call prompts:        <tool_call><tool_call><tool_call>...
 #   2. Streaming (occasionally): "Wait, I I I I I I I..."
@@ -22,11 +24,18 @@
 # (which is why the initial benchmarks passed); anything requiring structured
 # or long-recall output is unreliable.
 #
-# Cause: MTP draft head's attention states rely on KV cache precision in a
-# way that TurboQuant quantization formats (turboquant_k8v4, turboquant_4bit_nc,
-# turboquant_3bit_nc — tested all three) distort too much on rare-token
-# prompts. Either MTP alone or TurboQuant alone is fine; only the combination
-# fails. Filed upstream separately.
+# Isolation (three probes, see README "Technical background" section):
+#   (1) TurboQuant alone (no spec-decode) — works. TurboQuant itself is fine.
+#   (2) TurboQuant + ngram spec-decode    — same failure. Not MTP-specific.
+#   (3) MiMo-7B (pure dense attention, no DeltaNet) + TurboQuant + MTP
+#                                         — catastrophic first-token collapse.
+#                                           Not hybrid-specific either.
+#
+# Conclusion: the bug is in the TurboQuant attention backend under any
+# spec-decode's multi-token verify/rollback pattern — independent of draft
+# method and attention architecture. Tested presets that all fail with spec-
+# decode: turboquant_k8v4, turboquant_4bit_nc, turboquant_3bit_nc. Filed
+# upstream at vllm-project/vllm#40831.
 #
 # Use this config ONLY if:
 #   • your workload is short narrative / short code completions
