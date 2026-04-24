@@ -184,6 +184,24 @@ Expected numbers on a stock 3090 at 230W:
 
 ---
 
+## Known issues
+
+### Tool calling is broken in the default shipped config (investigating)
+
+**Status:** confirmed 2026-04-24 via `scripts/verify.sh`.
+
+**Symptom:** requests with a `tools: [...]` array return degenerate output — `<tool_call>` repeated until max_tokens, empty `tool_calls[]`, sometimes `I I I I` token loops. Run `scripts/verify.sh` to confirm this is what you're hitting.
+
+**Root cause:** not the Genesis tool_call fix (that applies correctly). MTP speculative decoding's draft acceptance collapses to 0% on tool-call-shaped prompts, and the main model's own samples also degenerate. Appears to be a quantization × spec-dec × prompt-class interaction, not a patch bug.
+
+**What works:** text-only completion ✅, vision ✅, long context ✅. Only tool calling is affected.
+
+**Investigation in progress** — we're running a sweep to isolate which component (MTP draft / turboquant_3bit_nc KV / AutoRound weights) is at fault, then will either ship a fixed config or document the workaround here. Follow commits + issues on this repo.
+
+**In the meantime** — if your app needs tool calls, either (a) use a different model temporarily, or (b) strip the `tools: [...]` param and handle tool invocation prompting-only without the structured API.
+
+---
+
 ## Troubleshooting
 
 ### `Cannot copy between CPU and CUDA tensors during CUDA graph capture`
