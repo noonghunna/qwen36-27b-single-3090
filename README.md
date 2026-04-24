@@ -1,6 +1,6 @@
 # Qwen3.6-27B on a single RTX 3090
 
-**85 TPS sustained · 106 TPS peak · 125K context · vision enabled · 230W cap**
+**92 TPS narrative · 95 TPS code · 125K context · vision enabled · 230W cap**
 
 A reproducible recipe for serving [`Lorbus/Qwen3.6-27B-int4-AutoRound`](https://huggingface.co/Lorbus/Qwen3.6-27B-int4-AutoRound) on a single consumer 24 GB RTX 3090, via vLLM with MTP speculative decoding + TurboQuant 3-bit KV cache. Built on top of [`Sandermage/genesis-vllm-patches`](https://github.com/Sandermage/genesis-vllm-patches) plus a CUDA graph capture fix for vLLM's TurboQuant backend that ships in this repo.
 
@@ -14,7 +14,7 @@ A reproducible recipe for serving [`Lorbus/Qwen3.6-27B-int4-AutoRound`](https://
 ```
   Qwen3.6-27B on 1× RTX 3090 (24 GB, 230W cap)
   ─────────────────────────────────────────────
-  Throughput      85 TPS sustained  /  106 TPS peak
+  Throughput      92 TPS (narrative)  /  95 TPS (code, peak 96)
   Context          125 K tokens (KV pool 198K)
   Vision           Enabled (MoonViT BF16)
   VRAM            21.3 / 24 GB
@@ -29,7 +29,7 @@ For comparison:
 |---|---|---|---|
 | vLLM + fp8 KV + MTP n=3 (earlier 3090 config) | 63.8 | 79.7 | 20 K |
 | [Lorbus card reference](https://huggingface.co/Lorbus/Qwen3.6-27B-int4-AutoRound) (RTX 5090) | ~60 | ~60 | 262 K |
-| **This repo (1× RTX 3090)** | **85 sustained / 103 peak** | **85 sustained / 106 peak** | **125 K** |
+| **This repo (1× RTX 3090)** | **91.9 mean / 95.3 peak** | **94.6 mean / 95.9 peak** | **125 K** |
 | llama.cpp mainline + q4_0 KV (single-card long-ctx fallback) | 28.5 | 28.4 | 262 K |
 
 ---
@@ -210,13 +210,19 @@ The MTP draft head's attention computation interacts badly with TurboQuant's KV 
 
 ### Pick a variant based on what you need
 
-| If you need... | Use | Ctx | TPS | Tools |
-|---|---|---|---|---|
-| **Max context + vision, no tools** (the article's headline) | `docker compose up -d` (default `docker-compose.yml`) | **125K** | **85/106** | ❌ |
-| **Tool calling + reasonable speed** | `docker compose -f docker-compose.tools.yml up -d` | 20K | 63/80 | ✅ |
-| **Tool calling + max context (slower)** | Copy `docker-compose.tools.yml`, set `--kv-cache-dtype turboquant_3bit_nc`, set `--max-model-len 125000`, remove the `--speculative-config` line | 125K | ~40-50 | ✅ |
+All three benched on a single RTX 3090 at 230W cap, vLLM image pinned to the tested digest, 3× warmup + 3× narrative (1000 tok) + 2× code (800 tok) runs.
+
+| If you need... | Use | Ctx | Narr TPS | Code TPS | Tools | VRAM |
+|---|---|---|---|---|---|---|
+| **Max context + vision, no tools** (the article's headline) | `docker compose up -d` (default `docker-compose.yml`) | **125K** | **91.9** | **94.6** (peak 95.9) | ❌ | 22.0 GB |
+| **Tool calling + reasonable speed** | `docker compose -f docker-compose.tools.yml up -d` | 20K | 65.9 | 84.4 (peak 85.2) | ✅ | 22.8 GB |
+| **Tool calling + max context (slower)** | Copy `docker-compose.tools.yml`, set `--kv-cache-dtype turboquant_3bit_nc`, set `--max-model-len 125000`, remove the `--speculative-config` line | 125K | 39.8 | 39.7 | ✅ | 22.0 GB |
+
+**Interpreting the code/narr split:** configs with MTP spec-decode produce faster code than narrative (code is more predictable → higher MTP accept → more tokens per verify step). Without MTP (config 3), the two converge around 40 TPS because decode is no longer draft-accelerated.
 
 Only one container can bind to port 8020 — `docker compose down` before switching.
+
+Measured 2026-04-24 on `vllm/vllm-openai@sha256:9bba4628a3b9...` (digest pinned in both compose files).
 
 ### Upstream-bug potential
 
