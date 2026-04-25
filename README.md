@@ -9,27 +9,24 @@ Based on [`Lorbus/Qwen3.6-27B-int4-AutoRound`](https://huggingface.co/Lorbus/Qwe
 
 ---
 
-## ⚠ About the 125K context headline
+## About the 125K context headline (now functional via cudagraph workaround)
 
-The [original write-up](https://medium.com/) reported 85–106 TPS at **125K context** using TurboQuant KV cache. Under broader functional testing since publication, we found that **TurboQuant KV × any speculative decoding method (MTP *or* ngram) has output-quality issues** on prompts that require structured or exact output:
+The [original write-up](https://medium.com/) reported 85–106 TPS at **125K context** using TurboQuant KV cache. Under broader functional testing since publication, we found that the originally-shipped 125K config produces **degenerate token loops on tool calls, long-context recall, and (occasionally) streaming**. Six probes traced the failure to **vLLM's CUDA graph capture/replay machinery for spec-decode + TurboQuant**, not the kernels or the attention math:
 
-- Tool calls: `<tool_call>` token loops, empty `tool_calls[]`
-- Long-context recall: model outputs first token then loops (`amber amber amber...`)
-- Streaming: occasional degenerate loops on some free-form completions
+| probe | turboquant | spec-dec | cudagraph | torch.compile | result | TPS |
+|---|---|---|---|---|---|---|
+| 1 | ✅ | ❌ | ✅ | ✅ | ✅ | 40 |
+| 2 | ✅ | ngram | ✅ | ✅ | ✗ loops | -- |
+| 3 (MiMo dense) | ✅ | MTP n=1 | ✅ | ✅ | ✗ collapse | -- |
+| 4 | ✅ | MTP | ✅ | + threshold=0 | ✗ | -- |
+| 5 | ✅ | MTP | ❌ | ❌ | ✅ | 23 |
+| **6** | ✅ | MTP | **❌** | ✅ | **✅** | **33** |
 
-The 125K **KV pool** fits; the **attention output quality** is unreliable under that config. Short narrative/code completions (what the benchmark measured) work fine; anything requiring recall or structured output doesn't.
+Probe 6 is the workable cut: **`--compilation-config '{"cudagraph_mode":"NONE"}'`** disables only CUDA graph capture, keeps torch.compile inductor on. All 7 verify-full.sh tests pass. TPS drops from ~85 (broken) to ~33 (correct), but 125K context + tools + recall + vision actually work.
 
-**We traced the failure through three probes:**
+This workaround is now baked into `docker-compose.longctx-experimental.yml` so that file ships a **functional** 125K config rather than the original broken one. When upstream fixes [#40831](https://github.com/vllm-project/vllm/issues/40831), drop the cudagraph-off flag and TPS recovers.
 
-1. TurboQuant with **MTP disabled** on the same model → every test passes cleanly. TurboQuant alone is not the bug.
-2. TurboQuant with **ngram speculative decoding** (no neural draft head) on the same model → same degenerate-loop failure shape. Rules out "the MTP draft head reading quantized KV" as the hypothesis.
-3. TurboQuant + MTP on **MiMo-7B-RL** (pure dense attention, no DeltaNet) → *catastrophic* first-token collapse. Rules out "hybrid-attention-specific bug."
-
-The bug is in the **TurboQuant attention backend under any spec-decode's multi-token verify/rollback pattern**, independent of draft method and independent of attention architecture. Severity scales with the fraction of full-attention layers: Qwen3.6 hybrid (25% full-attn) limps on structured outputs; MiMo dense (100% full-attn) collapses from token 1.
-
-**TurboQuant KV is a genuinely frontier-level KV compression.** It's been in vLLM mainline for only weeks and several open bugs show the backend is still being hardened around non-trivial write patterns (long prefill, high concurrency, hybrid layer geometry). The spec-decode interaction is another one of those edges. We've filed upstream as [#40831](https://github.com/vllm-project/vllm/issues/40831) with the full isolation matrix.
-
-**This repo's *default* config is now what we validated end-to-end:** MTP n=3 + **fp8_e5m2 KV** (not TurboQuant) + vision — 20K ctx, tools + streaming + recall all working. The 125K TurboQuant config is still available as `docker-compose.longctx-experimental.yml` for users who want the original headline behavior and understand the caveats.
+**The default config (`docker-compose.yml`) is unchanged** — MTP n=3 + fp8_e5m2 KV + vision at 20K, ~85 TPS peak. Use the long-context variant when you actually need the 125K KV pool and can pay the 60% TPS cost.
 
 ---
 
@@ -37,23 +34,26 @@ The bug is in the **TurboQuant attention backend under any spec-decode's multi-t
 
 Measured on 1× RTX 3090 at 230W cap, vLLM image pinned to tested digest, `scripts/verify-full.sh`:
 
-| Test | Default (MTP + fp8) | `tools-text.yml` (MTP + fp8 + no vision) | `longctx-experimental.yml` (MTP + turboquant) |
+| Test | Default (MTP + fp8) | `tools-text.yml` (MTP + fp8 + no vision) | `longctx-experimental.yml` (MTP + turboquant + cudagraph-off) |
 |---|---|---|---|
 | Server + Genesis patches | ✅ | ✅ | ✅ |
 | Basic completion (Paris) | ✅ | ✅ | ✅ |
-| **Tool calling** | **✅** | **✅** | ❌ `<tool_call>` loops |
-| **Streaming (SSE)** | **✅** clean output | **✅** clean output | ❌ degenerate loops on some prompts |
-| Thinking / reasoning | ✅ | ✅ | ✅ (slow to finish — Qwen3 is verbose) |
-| **Long-context recall** (10K) | **✅** | **✅** | ❌ first token + loop |
-| Long-context recall (30K) | n/a (20K cap) | **✅** | ❌ |
-| Long-context recall (60K) | n/a | **✅** | ❌ |
-| Short-prompt TPS (narr / code) | 65.9 / 84.4 | 65.2 / 83.8 | 91.9 / 94.6 |
-| Peak TPS | 85 | 85 | 96 |
-| Max context | 20K | **75K** | 125K (KV pool, attention unreliable) |
+| **Tool calling** | **✅** | **✅** | **✅** |
+| **Streaming (SSE)** | **✅** clean output | **✅** clean output | **✅** clean output |
+| Thinking / reasoning | ✅ | ✅ | ✅ |
+| **Long-context recall** (10K) | **✅** | **✅** | **✅** |
+| Long-context recall (30K) | n/a (20K cap) | **✅** | **✅** |
+| Long-context recall (60K) | n/a | **✅** | **✅** |
+| Long-context recall (90K) | n/a | n/a (75K cap) | **✅** |
+| Short-prompt TPS (narrative) | 65.9 | 65.2 | **33.0** (cudagraph-off cost) |
+| Peak TPS | 85 | 85 | 33 |
+| Max context | 20K | **75K** | **125K** |
 | Vision | ✅ | ❌ | ✅ |
 | VRAM | 22.8 GB | 22.2 GB | 22.0 GB |
 
-**Root cause of the ❌ cells:** Any speculative decoding method combined with any TurboQuant KV preset produces degenerate token loops. Tested combinations that all fail: MTP (n=1, 2, 3, 4) × `turboquant_3bit_nc` / `turboquant_4bit_nc` / `turboquant_k8v4`, and ngram spec-decode × `turboquant_3bit_nc`. Also independently verified on **MiMo-7B-RL** (dense-attention non-hybrid model — collapses from the first generated token). Either spec-decode alone (on fp8 KV) or TurboQuant alone (spec-decode off) works fine — only the combination fails. Filed upstream as [#40831](https://github.com/vllm-project/vllm/issues/40831) with full isolation matrix (separate from #40807, which is the CUDA graph crash we work around locally).
+All three configs now pass every test. The 125K variant pays a ~60% TPS cost for `cudagraph_mode=NONE`, which is the workaround for upstream bug [#40831](https://github.com/vllm-project/vllm/issues/40831). When that lands, drop the flag and TPS recovers.
+
+**The original 125K headline (~85–95 TPS) was reproducible only on workloads that don't exercise structured output:** plain narrative or code generation. Tool calls, long-context recall, and streaming all fail catastrophically with cudagraph on under spec-decode. The six-probe ladder above isolates the bug to the CUDA graph capture/replay layer specifically; Triton kernels and torch.compile inductor output are correct when invoked dynamically.
 
 ---
 
@@ -225,53 +225,58 @@ Expected numbers on a stock 3090 at 230W:
 | narrative (warmed) | 10–16 s | 60–105 |
 | code (warmed) | 8–12 s | 60–100 |
 
-**High variance on the experimental 125K config is normal** — MTP acceptance dips cause individual requests to drop into the 60–70 TPS range on the TurboQuant variant. Default + tools-text are much more consistent (fp8 KV doesn't have the same variance profile).
+The 125K variant runs at a more uniform ~33 TPS because it's eager-mode for cudagraph; spec-decode acceptance dips don't compound with cudagraph variance.
 
 ---
 
 ## Pick a compose variant
 
-| Workload | Compose file | Context |
-|---|---|---|
-| **Default — vision + tools + 20K** (validated end-to-end) | `docker-compose.yml` | 20K |
-| **Text-only agents + 75K ctx** (drops vision) | `docker-compose.tools-text.yml` | 75K |
-| **⚠ Experimental — 125K pool, TurboQuant-only** (tools broken, recall loops) | `docker-compose.longctx-experimental.yml` | 125K KV pool |
+| Workload | Compose file | Context | TPS |
+|---|---|---|---|
+| **Default — vision + tools + 20K** (validated end-to-end) | `docker-compose.yml` | 20K | ~85 peak |
+| **Text-only agents + 75K ctx** (drops vision) | `docker-compose.tools-text.yml` | 75K | ~85 peak |
+| **Long-context — 125K + tools + recall + vision** (cudagraph-off workaround) | `docker-compose.longctx-experimental.yml` | 125K | ~33 sustained |
 
 Only one container can bind to port 8020 at a time — `docker compose down` before switching.
 
-All three compose files use the same pinned vLLM image digest, the same Genesis patches, and the same MTP n=3 spec-decode. The only differences are `--kv-cache-dtype`, `--max-model-len`, and whether `--language-model-only` is set.
+All three compose files use the same pinned vLLM image digest, the same Genesis patches, the same MTP n=3 spec-decode, and the same `patch_tolist_cudagraph.py`. The 125K variant additionally passes `--compilation-config '{"cudagraph_mode":"NONE"}'` as a workaround for [#40831](https://github.com/vllm-project/vllm/issues/40831). The other differences are `--kv-cache-dtype`, `--max-model-len`, and whether `--language-model-only` is set.
 
 ---
 
-## Technical background — why turboquant is on the experimental shelf
+## Technical background — why the long-ctx config disables cudagraph
 
-**TurboQuant KV is frontier-level.** It landed in vLLM mainline only weeks before this repo was published and is still under active development. The spec-decode × TurboQuant interaction we hit is one of several compatibility edges that upstream is still working through (see vLLM's tracking issue [#40069](https://github.com/vllm-project/vllm/issues/40069) — "Speculative decoding / Eagle" and "Hybrid attention models" are both still unchecked boxes, and our [#40831](https://github.com/vllm-project/vllm/issues/40831) is a concrete repro of both).
+**TurboQuant KV is frontier-level.** It landed in vLLM mainline only weeks before this repo was published and is still under active development. The spec-decode × TurboQuant interaction we hit is one of several compatibility edges upstream is still working through (see vLLM's tracking issue [#40069](https://github.com/vllm-project/vllm/issues/40069) — "Speculative decoding / Eagle" and "Hybrid attention models" both unchecked).
 
-What we observed across three probes on two different models:
+We isolated the bug through six probes:
 
-| Model | Attention | KV | Spec-decode | Structured outputs |
-|---|---|---|---|---|
-| Qwen3.6-27B | hybrid (16/64 full-attn) | `turboquant_3bit_nc` | MTP n=3 | ❌ degenerate token loops |
-| Qwen3.6-27B | hybrid | `turboquant_4bit_nc` | MTP n=3 | ❌ same |
-| Qwen3.6-27B | hybrid | `turboquant_k8v4` | MTP n=3 | ❌ same |
-| Qwen3.6-27B | hybrid | `turboquant_3bit_nc` | MTP n=1 | ❌ same (not N-dependent) |
-| Qwen3.6-27B | hybrid | `turboquant_3bit_nc` | **ngram n=3** | ❌ **same shape — not MTP-specific** |
-| **MiMo-7B-RL** | **dense (36/36)** | `turboquant_3bit_nc` | MTP n=1 | ❌ **total collapse from token 1** |
-| MiMo-7B-RL | dense | `turboquant_3bit_nc` | **off** | ✅ fully coherent |
-| Qwen3.6-27B | hybrid | `turboquant_3bit_nc` | **off** | ✅ all tests pass |
-| Qwen3.6-27B | hybrid | **`fp8_e5m2`** | MTP n=3 | ✅ all tests pass |
+| # | turboquant | spec-dec | cudagraph | torch.compile | result | TPS |
+|---|---|---|---|---|---|---|
+| 1 | ✅ | off | ✅ | ✅ | ✅ all tests pass | 40 |
+| 2 | ✅ | ngram n=3 | ✅ | ✅ | ✗ same loops as MTP | -- |
+| 3 (MiMo dense) | ✅ | MTP n=1 | ✅ | ✅ | ✗ first-token collapse | -- |
+| 4 | ✅ | MTP n=3 | ✅ | + `_CONTINUATION_DECODE_THRESHOLD=0` | ✗ | -- |
+| 5 | ✅ | MTP n=3 | ❌ | ❌ | ✅ all tests pass | 23 |
+| **6** | ✅ | MTP n=3 | **❌** | ✅ | **✅ all tests pass** | **33** |
 
-Earlier write-ups speculated this was an "MTP draft head reading quantized KV" issue. The ngram result (no neural draft) and the MiMo dense-attention result disprove that hypothesis. The bug is in the **TurboQuant attention backend under any spec-decode's multi-token verify/rollback/re-read pattern** — independent of draft method and independent of attention architecture. Probable culprit is one of: speculative writes not tagged as tentative in the store path; decode kernel returning non-deterministic dequant across redundant reads; or rollback state not propagating when a draft is rejected.
+**What this isolates:**
 
-Severity scales with the fraction of full-attention layers TurboQuant quantizes: Qwen3.6 (25% full-attn) limps on structured outputs but plain narrative sometimes limps through; MiMo (100% full-attn) collapses on the first generated token regardless of prompt.
+- Probe 1 → TurboQuant alone is fine.
+- Probes 2-3 → bug isn't MTP-specific; isn't hybrid-attention-specific.
+- Probe 4 → bug isn't in the within-batch `_prefill_attention` decode-fast-path routing (paper-backed bias-compounding hypothesis was wrong).
+- Probe 5 → disabling **both** torch.compile and cudagraph fixes the bug — compilation machinery is the culprit.
+- Probe 6 → disabling **only** cudagraph (keeping torch.compile inductor on) also fixes the bug — **isolating the bug to CUDA graph capture/replay specifically**.
+
+**The Triton kernels are correct when invoked dynamically. torch.compile inductor output is correct.** What corrupts the output is how the captured CUDA graph handles spec-decode's runtime shapes vs warmup-shape capture for the TurboQuant attention path. Probable specific cause: shape-specialized buffers like `_tq_mid_o_buf` are sized at `B = max_num_seqs` during pre-allocation but spec-decode verify routes through `_prefill_attention` with `B = q_len`, and the captured graph references buffer addresses that don't match runtime addresses.
+
+The 125K compose ships `--compilation-config '{"cudagraph_mode":"NONE"}'` as the workaround. Cost: ~60% TPS (85 → 33 narrative). Drop the flag once upstream fixes the bug.
 
 **What we're doing about it:**
 
-- **[#40807](https://github.com/vllm-project/vllm/issues/40807)** — CUDA graph crash we worked around with `patches/patch_tolist_cudagraph.py`
-- **[#40831](https://github.com/vllm-project/vllm/issues/40831)** — output-quality bug filed with full isolation matrix; comments cross-reference adjacent PRs ([#40074](https://github.com/vllm-project/vllm/pull/40074), [#40122](https://github.com/vllm-project/vllm/pull/40122), [#40706](https://github.com/vllm-project/vllm/pull/40706), [#40798](https://github.com/vllm-project/vllm/pull/40798)) that are touching the same backend paths
-- The repo's default will stay on fp8_e5m2 until upstream has a tested fix
+- **[#40807](https://github.com/vllm-project/vllm/issues/40807)** — CUDA graph crash workaround via `patches/patch_tolist_cudagraph.py` (separate from #40831).
+- **[#40831](https://github.com/vllm-project/vllm/issues/40831)** — output-quality bug, six-probe isolation in the issue. Cross-references adjacent PRs ([#40074](https://github.com/vllm-project/vllm/pull/40074), [#40122](https://github.com/vllm-project/vllm/pull/40122), [#40706](https://github.com/vllm-project/vllm/pull/40706), [#40798](https://github.com/vllm-project/vllm/pull/40798)).
+- The default config stays on fp8_e5m2 (no cudagraph workaround needed) at 20K ctx, ~85 TPS.
 
-When TurboQuant gets proper spec-decode compatibility in mainline, the default will swap back to a long-ctx config and we'll update this README + article accordingly. Until then, treat `turboquant_*` KV presets combined with any speculative decoding as cutting-edge with known rough edges.
+When upstream resolves the cudagraph capture issue, the long-ctx variant drops `cudagraph_mode=NONE` and TPS recovers to the original ~85+.
 
 ---
 
@@ -302,13 +307,13 @@ You edited `--max-num-batched-tokens`. Keep it ≥ 4128 for this context length 
 
 ### Short-prompt TPS stuck at ~30
 
-You probably have `--compilation-config.cudagraph_mode=none` somewhere. Remove it — our patch fixes the underlying bug, cudagraphs should stay on.
+If you're on `docker-compose.longctx-experimental.yml`, this is **expected** — it ships `--compilation-config '{"cudagraph_mode":"NONE"}'` as a workaround for [#40831](https://github.com/vllm-project/vllm/issues/40831). Sustained ~33 TPS at 125K ctx is the cost of correctness on that variant. Use the default `docker-compose.yml` for ~85 TPS at 20K. If you're seeing ~30 TPS on the default, something else is wrong — check that `patch_tolist_cudagraph.py` applied (`docker logs ... | grep tolist_cudagraph_fix`).
 
 ### Tool calls return `<tool_call>{...}</tool_call>` as plain text (tool extraction doesn't fire)
 
 Two possible causes; the logs distinguish them:
 
-**Cause A — you're running the experimental compose** (`docker-compose.longctx-experimental.yml`). Tool calls are **known broken** on that config due to TurboQuant KV × spec-decode incompatibility (confirmed on both MTP and ngram draft methods, independent of model architecture — see "Technical background" section above and the file header of the experimental compose). The fix is to use the default `docker-compose.yml` (or `docker-compose.tools-text.yml` if you need more context).
+**Cause A — you removed `cudagraph_mode=NONE` from the long-ctx compose.** The original 125K config (cudagraph on) hits [#40831](https://github.com/vllm-project/vllm/issues/40831) and produces `<tool_call>` loops. The shipped `docker-compose.longctx-experimental.yml` already includes the cudagraph-off workaround; if you stripped that flag for performance, restore it.
 
 **Cause B — Genesis patch anchor drift.** Check container logs for:
 
@@ -343,9 +348,9 @@ qwen36-27b-single-3090/
 │   ├── patch_tolist_cudagraph.py               our CUDA graph capture fix
 │   └── genesis/                                (gitignored; fetched by setup.sh)
 ├── compose/
-│   ├── docker-compose.yml                      DEFAULT — MTP + fp8 + vision, 20K
-│   ├── docker-compose.tools-text.yml           text-only, 75K ctx
-│   └── docker-compose.longctx-experimental.yml 125K pool — ⚠ quality caveats in file
+│   ├── docker-compose.yml                      DEFAULT — MTP + fp8 + vision, 20K, ~85 TPS
+│   ├── docker-compose.tools-text.yml           text-only, 75K ctx, ~85 TPS
+│   └── docker-compose.longctx-experimental.yml 125K + vision via cudagraph-off, ~33 TPS
 └── scripts/
     ├── setup.sh                                clone Genesis + download model + SHA verify
     ├── verify.sh                               quick smoke test (~10 sec)
@@ -366,13 +371,12 @@ qwen36-27b-single-3090/
 ## Upstream status
 
 - **[#40069](https://github.com/vllm-project/vllm/issues/40069)** — TurboQuant/HIGGS follow-ups tracker (upstream). Lists "Speculative decoding / Eagle" and "Hybrid attention models" as unchecked.
-- **[#40807](https://github.com/vllm-project/vllm/issues/40807)** — our CUDA graph `.tolist()` bug; worked around locally via `patch_tolist_cudagraph.py`.
-- **[#40831](https://github.com/vllm-project/vllm/issues/40831)** — our TurboQuant × any-spec-decode output-quality bug; confirmed across both MTP and ngram, and across hybrid (Qwen3.6) and dense (MiMo-7B) attention. No local workaround; use `fp8_e5m2` KV instead of `turboquant_*` until fixed.
-- vLLM PR: not yet submitted — `patch_tolist_cudagraph.py` is the short-term workaround for #40807; #40831 needs an upstream fix in the TurboQuant backend.
-- Sandermage Genesis: we may contribute `patch_tolist_cudagraph.py` upstream as a new patch in their unified script.
-- Lorbus HF discussion: caveat about the Ampere cudagraph requirement posted at TBD.
+- **[#40807](https://github.com/vllm-project/vllm/issues/40807)** — our CUDA graph `.tolist()` crash; worked around locally via `patch_tolist_cudagraph.py`. Sandermage's [v7.10 Genesis tree](https://github.com/Sandermage/genesis-vllm-patches) reaches the same end state via pre-allocation (Patches 23 + 44).
+- **[#40831](https://github.com/vllm-project/vllm/issues/40831)** — our TurboQuant × spec-decode output-quality bug. Six-probe ladder isolates it to **CUDA graph capture/replay** (probe 6: cudagraph off, torch.compile on → all tests pass at 33 TPS). Workaround: `--compilation-config '{"cudagraph_mode":"NONE"}'`, applied automatically in `docker-compose.longctx-experimental.yml`.
+- vLLM PR: not yet submitted — both issues need upstream fixes. Our patches are short-term workarounds.
+- Sandermage Genesis: we may contribute `patch_tolist_cudagraph.py` to their unified script. They have offered to extract Patches 23 + 44 to upstream.
 
-Once upstream vLLM handles both issues, this repo becomes a historical curiosity and the default compose can move to TurboQuant KV for the full 125K pool. Until then: fp8_e5m2 + MTP is the validated sweet spot.
+Once upstream resolves #40831, the long-ctx compose drops the `cudagraph_mode=NONE` flag and TPS should recover from 33 → 85+. Until then: fp8_e5m2 + MTP at 20K (default) is the fast option, cudagraph-off + turboquant + MTP at 125K (long-ctx variant) is the long-context option, both fully functional.
 
 ---
 
