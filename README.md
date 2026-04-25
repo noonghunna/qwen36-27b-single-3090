@@ -5,7 +5,7 @@
 Based on [`Lorbus/Qwen3.6-27B-int4-AutoRound`](https://huggingface.co/Lorbus/Qwen3.6-27B-int4-AutoRound) via vLLM with MTP speculative decoding + fp8_e5m2 KV cache. Built on [`Sandermage/genesis-vllm-patches`](https://github.com/Sandermage/genesis-vllm-patches) + a CUDA graph capture fix that ships in this repo.
 
 > 📖 **Write-up:** *[Qwen3.6-27B on a single RTX 3090 — the recipe](https://medium.com/)*
-> 🐛 **Upstream bug reports:** [vllm-project/vllm#40807](https://github.com/vllm-project/vllm/issues/40807) (CUDA graph crash — worked around locally) · [vllm-project/vllm#40831](https://github.com/vllm-project/vllm/issues/40831) (TurboQuant × spec-decode output-quality, isolated to cudagraph capture; root cause TBD)
+> 🐛 **Upstream bug reports:** [vllm-project/vllm#40807](https://github.com/vllm-project/vllm/issues/40807) (CUDA graph crash — worked around locally) · [vllm-project/vllm#40831](https://github.com/vllm-project/vllm/issues/40831) (TurboQuant × spec-decode output corruption — closed for ngram path via @Sandermage's v7.13 + [#40875](https://github.com/vllm-project/vllm/issues/40875) `prompt_lookup_min=8` config) · [vllm-project/vllm#40880](https://github.com/vllm-project/vllm/issues/40880) (MTP × TurboQuant × cudagraph — open, our `cudagraph_mode=NONE` workaround stands)
 
 ---
 
@@ -236,7 +236,7 @@ Measured on 1× RTX 3090 at 230W cap, vLLM image pinned to tested digest, `scrip
 | Vision | ✅ | ❌ | ✅ |
 | VRAM | 22.8 GB | 22.2 GB | 22.0 GB |
 
-**The original 125K headline (~85–95 TPS) was reproducible only on workloads that don't exercise structured output:** plain narrative or code generation. Tool calls, long-context recall, and streaming all fail catastrophically with cudagraph on under spec-decode. The eight-probe ladder in [Technical background](#technical-background--whats-broken-upstream-and-why-we-work-around-it) below isolates the bug to the CUDA graph capture/replay layer specifically; Triton kernels and torch.compile inductor output are correct when invoked dynamically.
+**The original 125K headline (~85–95 TPS) was reproducible only on workloads that don't exercise structured output:** plain narrative or code generation. Tool calls, long-context recall, and streaming all fail catastrophically with cudagraph on under MTP spec-decode. The nine-probe ladder in [Technical background](#technical-background--whats-broken-upstream-and-why-we-work-around-it) below isolates the bug to the CUDA graph capture/replay layer specifically; Triton kernels and torch.compile inductor output are correct when invoked dynamically. The ngram path is now fixed upstream (closed for ngram in #40831 via Sander's v7.13 + #40875); MTP remains tracked at [#40880](https://github.com/vllm-project/vllm/issues/40880).
 
 ---
 
@@ -244,7 +244,7 @@ Measured on 1× RTX 3090 at 230W cap, vLLM image pinned to tested digest, `scrip
 
 **TurboQuant KV is frontier-level.** It landed in vLLM mainline only weeks before this repo was published and is still under active development. The spec-decode × TurboQuant interaction we hit is one of several compatibility edges upstream is still working through (see vLLM's tracking issue [#40069](https://github.com/vllm-project/vllm/issues/40069) — "Speculative decoding / Eagle" and "Hybrid attention models" both unchecked).
 
-Initial symptom: under the originally-shipped 125K config (TurboQuant KV + MTP spec-decode + cudagraph on), the model produces degenerate token loops on tool calls, long-context recall, and occasionally streaming. We isolated the bug through eight probes:
+Initial symptom: under the originally-shipped 125K config (TurboQuant KV + MTP spec-decode + cudagraph on), the model produces degenerate token loops on tool calls, long-context recall, and occasionally streaming. We isolated the bug through nine probes:
 
 | # | turboquant | spec-dec | cudagraph | torch.compile | result | TPS |
 |---|---|---|---|---|---|---|
@@ -256,6 +256,8 @@ Initial symptom: under the originally-shipped 125K config (TurboQuant KV + MTP s
 | **6** | ✅ | MTP n=3 | **❌** | ✅ | **✅ all tests pass** | **33** |
 | 7 | ✅ | MTP n=3 (9-prompt structured-output sweep) | ❌ | ✅ | ✅ all 9 prompts pass | 33 |
 | 8 | ✅ | MTP n=3 + PR #40798 backport | ✅ | ✅ | ✗ same loops | 96 |
+| **9A** | ✅ | MTP n=3 + Genesis v7.13 (#40738 + parser fixes) | ✅ | ✅ | ✗ tool calls fail, recall truncates | -- |
+| **9C** | ✅ | ngram n=3 + `prompt_lookup_min=8` + Genesis v7.13 | ✅ | ✅ | ✅ short-ctx clean (filed as cross-confirmation of #40875) | 35 |
 
 **What this isolates:**
 
@@ -265,11 +267,13 @@ Initial symptom: under the originally-shipped 125K config (TurboQuant KV + MTP s
 - Probe 5 → disabling **both** torch.compile and cudagraph fixes the bug — compilation machinery is the culprit.
 - Probe 6 → disabling **only** cudagraph (keeping torch.compile inductor on) also fixes the bug — **isolating the bug to CUDA graph capture/replay specifically**.
 - Probe 7 → confirmed against [Sander's 9-prompt corruption-detection suite](https://github.com/vllm-project/vllm/issues/40831#issuecomment-4317214311) (`tool_call_simple`, `code_quicksort`, `structured_xml`, etc.) — all clean.
-- Probe 8 → backported PR #40798 (workspace-manager refactor — Sander's and our best structural-fix candidate). Bug persists. So the buffer-pointer-drift hypothesis is wrong or insufficient on its own.
+- Probe 8 → backported PR #40798 (workspace-manager refactor). Bug persists. Buffer-pointer-drift hypothesis was insufficient.
+- **Probe 9A → Sander's v7.13 backports (#40738 + parser fixes) do NOT fix MTP × TurboQuant × cudagraph on Qwen3.6-27B.** Filed as [#40880](https://github.com/vllm-project/vllm/issues/40880) — explicitly per Sander's handoff that the v7.13 cycle didn't test MTP at all.
+- **Probe 9C → ngram + `prompt_lookup_min=8` + v7.13 backports DO work** at short context (cross-rig + cross-model confirmation of [#40875](https://github.com/vllm-project/vllm/issues/40875)). At ~30K context the stack OOMs due to v7.13's expanded prealloc footprint on a 24 GB card.
 
-**The Triton kernels are correct when invoked dynamically. torch.compile inductor output is correct.** What corrupts the output is how the captured CUDA graph handles spec-decode's runtime shapes vs warmup-shape capture for the TurboQuant attention path. Specific root cause is still **TBD upstream**.
+**The Triton kernels are correct when invoked dynamically. torch.compile inductor output is correct.** What corrupts the output is how the captured CUDA graph handles spec-decode's runtime shapes vs warmup-shape capture for the TurboQuant attention path. The ngram path is fixed upstream; the MTP path remains open and is what `cudagraph_mode=NONE` works around.
 
-The 125K compose ships `--compilation-config '{"cudagraph_mode":"NONE"}'` as the interim workaround. Cost: ~60% TPS (85 → 33 narrative). Drop the flag once upstream lands a fix.
+The 125K compose ships `--compilation-config '{"cudagraph_mode":"NONE"}'` as the interim workaround. Cost: ~60% TPS (85 → 33 narrative). Drop the flag once [#40880](https://github.com/vllm-project/vllm/issues/40880) lands.
 
 ---
 
@@ -368,8 +372,10 @@ qwen36-27b-single-3090/
 
 - **[#40069](https://github.com/vllm-project/vllm/issues/40069)** — TurboQuant/HIGGS follow-ups tracker (upstream). Lists "Speculative decoding / Eagle" and "Hybrid attention models" as unchecked.
 - **[#40807](https://github.com/vllm-project/vllm/issues/40807)** — our CUDA graph `.tolist()` crash; worked around locally via `patch_tolist_cudagraph.py`. Sandermage's [v7.10 Genesis tree](https://github.com/Sandermage/genesis-vllm-patches) reaches the same end state via pre-allocation (Patches 23 + 44).
-- **[#40831](https://github.com/vllm-project/vllm/issues/40831)** — our TurboQuant × spec-decode output-quality bug. Eight-probe ladder + Sander's independent confirmation isolate it to **CUDA graph capture/replay** (probe 6: cudagraph off, torch.compile on → all 9 prompts pass at 33 TPS, including Sander's `tool_call_simple` / `code_quicksort` / `structured_xml` failure cases). Workaround: `--compilation-config '{"cudagraph_mode":"NONE"}'`, applied automatically in `docker-compose.longctx-experimental.yml`. Root cause within the cudagraph layer: still TBD upstream — see #40798 below.
-- **[PR #40798](https://github.com/vllm-project/vllm/pull/40798)** — *initially hypothesized fix; tested via probe 8 backport, **bug persists**.* Moves `_tq_mid_o_buf` / `_tq_output_buf` / `_tq_lse_buf` from per-layer `register_buffer(B=max_num_seqs)` to `WorkspaceManager.get_simultaneous()`. Sander and I both expected this would close the pointer-drift between warmup-shape capture and runtime-shape replay. We applied the PR's full diff to the pinned nightly via [`patches/patch_pr40798_workspace.py`](./patches/patch_pr40798_workspace.py) (research artifact, not shipped) and ran verify-full.sh + the 9-prompt Layer-2 probe against the cudagraph-on config. Same degenerate loops as before. Either #40798 is necessary but not sufficient, or a companion change in `main` we haven't backported is also required, or the bug is in a different code path than the per-layer scratch buffers entirely.
+- **[#40831](https://github.com/vllm-project/vllm/issues/40831)** — our TurboQuant × spec-decode output-quality bug. **Closed for the ngram path** via Sander's v7.13 backports of upstream PRs (#40738 GDN state recovery + #36138 + #40783 + #39055) plus the [#40875](https://github.com/vllm-project/vllm/issues/40875) `prompt_lookup_min=8` config trick. **MTP path remains broken** — tracked at [#40880](https://github.com/vllm-project/vllm/issues/40880) (see below).
+- **[#40875](https://github.com/vllm-project/vllm/issues/40875)** — Sander's follow-up identifying that `prompt_lookup_min=2` (default) causes ngram to find spurious matches in chat-template tool definitions. Setting `prompt_lookup_min=8` is a config-only fix, validated on Sander's 35B-A3B and confirmed on our 27B (probe 9 Test C). For ngram users, this + v7.13 backports = working stack with cudagraph ON.
+- **[#40880](https://github.com/vllm-project/vllm/issues/40880)** — our MTP-specific follow-up filed at Sander's [explicit handoff](https://github.com/vllm-project/vllm/issues/40831#issuecomment-4319965017): *"we did not test MTP at all in the v7.13 cycle... your data shows that assumption is wrong."* MTP × TurboQuant × cudagraph remains broken even with all v7.13 backports applied (probe 9 Test A); the four upstream PRs scope to ngram's GDN state recovery and don't cover the Eagle/MTP forward path. **Our `cudagraph_mode=NONE` workaround in `docker-compose.longctx-experimental.yml` stays in place until this lands.**
+- **[PR #40798](https://github.com/vllm-project/vllm/pull/40798)** — *hypothesized fix that didn't pan out.* Moves `_tq_mid_o_buf` / `_tq_output_buf` / `_tq_lse_buf` from per-layer `register_buffer(B=max_num_seqs)` to `WorkspaceManager.get_simultaneous()`. Sander and I both expected this would close the pointer-drift between warmup-shape capture and runtime-shape replay. Probe 8 backported the full PR diff via [`patches/patch_pr40798_workspace.py`](./patches/patch_pr40798_workspace.py) (research artifact, not shipped) and the bug persisted. Useful negative result documented on the PR thread.
 - **Sandermage's [P56](https://github.com/Sandermage/genesis-vllm-patches/blob/main/vllm/_genesis/wiring/patch_56_spec_decode_decode_path_guard.py)** — routing-layer workaround (architecturally equivalent to our Probe 4 patch). Marked superseded by our `cudagraph_mode=NONE` workaround since it only addresses the catastrophic surface.
 - Sandermage Genesis: we may contribute `patch_tolist_cudagraph.py` to their unified script. They have offered to extract Patches 23 + 44 to upstream.
 
