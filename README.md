@@ -12,21 +12,25 @@ Based on [`Lorbus/Qwen3.6-27B-int4-AutoRound`](https://huggingface.co/Lorbus/Qwe
 
 ## Status at a glance
 
-Four configurations, all functional. Pick by workload — there's a real per-stream-TPS-vs-tool-correctness tradeoff because of [vllm#40880](https://github.com/vllm-project/vllm/issues/40880) (the silent MTP × TurboQuant tool-call cascade bug).
+Six configurations, all functional. Pick by workload — there's a real per-stream-TPS-vs-tool-correctness tradeoff because of [vllm#40880](https://github.com/vllm-project/vllm/issues/40880) (the silent MTP × TurboQuant tool-call cascade bug).
 
-| Variant | Context | TPS narr/peak | Vision | Tools | Notes |
-|---|---|---|---|---|---|
-| **Default** (`docker-compose.yml`) — fp8 KV + MTP | 20K | 66 / 85 | ✅ | ✅ | fp8 KV sidesteps the cudagraph bug entirely. Recommended for ≤20K workloads. |
-| **Tools-text** (`docker-compose.tools-text.yml`) — fp8 + 75K | 75K | 65 / 85 | ❌ | ✅ | Drops vision to free KV pool. fp8 KV — bug doesn't fire. |
-| **Legacy long-ctx** (`docker-compose.longctx-experimental.yml`) — TurboQuant + cudagraph_mode=NONE | 125K | ~33 | ✅ | ✅ | TurboQuant 3-bit. Ships `cudagraph_mode=NONE` workaround → -65% TPS, full correctness. |
-| **v7.14** (`docker-compose.v714.yml`) — TurboQuant + Genesis v7.14 P65 ⭐ | 32K | 55-72 | ✅ | ✅ | Surgical workaround. P65 auto-downgrades cudagraph for spec-decode only. -25% from old fast path. |
-| ~~**Old fast path**~~ — TurboQuant + FULL cudagraph | ~~125K~~ | ~~92-95~~ | ✅ | **✗ silently broken** | Not shipped as a compose. Tool calls produce `<tool_call>` cascade. Hidden from plain TPS measurement. |
+| Variant | Context | TPS narr/peak | Vision | Tools | Patches | Notes |
+|---|---|---|---|---|---|---|
+| **Default** (`docker-compose.yml`) — fp8 KV + MTP | 20K | 66 / 85 | ✅ | ✅ | Genesis | fp8 KV sidesteps the cudagraph bug entirely. Recommended for ≤20K workloads. |
+| **Tools-text** (`docker-compose.tools-text.yml`) — fp8 + 75K | 75K | 65 / 85 | ❌ | ✅ | Genesis | Drops vision to free KV pool. fp8 KV — bug doesn't fire. |
+| **Legacy long-ctx** (`docker-compose.longctx-experimental.yml`) — TurboQuant + cudagraph_mode=NONE | 125K | ~33 | ✅ | ✅ | Genesis | TurboQuant 3-bit. Ships `cudagraph_mode=NONE` workaround → -65% TPS, full correctness. |
+| **v7.14** (`docker-compose.v714.yml`) — TurboQuant + Genesis v7.14 P65 ⭐ | 32K | 55-72 | ✅ | ✅ | Genesis v7.14+ | Surgical workaround. P65 auto-downgrades cudagraph for spec-decode only. -25% from old fast path. |
+| **Eager** (`docker-compose.eager.yml`) — `--enforce-eager` + 125K + tools | 125K | 52-65 | ✅ | ✅ | **none** | No spec-decode bug class because no cudagraph to capture. Sweet spot for "spec-decode + 125K + tools without the patch tree". Suggested by [@ampersandru](https://github.com/ampersandru) in [#1](https://github.com/noonghunna/qwen36-27b-single-3090/issues/1). |
+| **Minimal** (`docker-compose.minimal.yml`) — no spec-decode, fp8 KV | 32K | ~30 | ✅ | ✅ | **none** | Simplest stack. No spec-decode → no #40880 trigger → no patches needed. ~30 TPS but rock-solid, every feature works. Pick when stability > peak TPS. |
+| ~~**Old fast path**~~ — TurboQuant + FULL cudagraph | ~~125K~~ | ~~92-95~~ | ✅ | **✗ silently broken** | n/a | Not shipped as a compose. Tool calls produce `<tool_call>` cascade. Hidden from plain TPS measurement. |
 
 ### Decision tree
 
-- **Need 20K ctx, full features?** → Default. No reason to look further.
-- **Need long ctx (>32K) + tool calls + decent TPS?** → **v7.14** (32K — practical limit on consumer 24 GB with v7.14's PIECEWISE spec-verify).
-- **Need 125K ctx + tool calls, OK with low TPS?** → Legacy long-ctx (`cudagraph_mode=NONE`).
+- **Want simplest possible stack, no patches, no fuss?** → **Minimal**. ~30 TPS, every feature works, zero risk.
+- **Need 20K ctx, full features, max TPS?** → Default. No reason to look further.
+- **Need 125K ctx + tools but want zero-patch simplicity?** → **Eager** (`--enforce-eager`, no Genesis tree, ~52–65 TPS at 125K).
+- **Need 32K ctx + tools at peak TPS, OK with patch tree?** → **v7.14** (Genesis P65, 55–72 TPS at 32K).
+- **Need 125K ctx + tool calls, OK with very low TPS?** → Legacy long-ctx (`cudagraph_mode=NONE`).
 - **Need 75K ctx + tools but no vision?** → Tools-text.
 - **Plain chat / code generation, no tool calls, max TPS?** → The "old fast path" *technically* exists (use legacy long-ctx compose with `--compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}'`) — but verify your workload via `bash scripts/verify-full.sh` first because the tool-call bug fires silently.
 
