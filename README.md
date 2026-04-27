@@ -43,6 +43,10 @@ This is a workaround. The proper fix is a custom multi-query Triton kernel (P67)
 - **125K context at FULL cudagraph speed (~95 TPS) WITH tool calls** — that combination requires the proper P67 kernel. Until then, you pick two of three: long ctx, full TPS, working tools.
 - **GGUF on vLLM for Qwen3-Next family** — not supported upstream yet (4 PRs open + a missing port of `Qwen35TensorProcessor` value transforms). Use llama.cpp / Ollama if you specifically need GGUF.
 
+### Recently fixed
+
+- **2026-04-27** — `patches/patch_tolist_cudagraph.py` was silently failing on (a) any non-docker setup (hardcoded `dist-packages` path) and (b) any vLLM nightly past the one we initially tested against (multi-line block anchors fragile against upstream rewording). Symptom: patcher logs "anchor NOT FOUND" but doesn't fail-stop, so users boot vLLM thinking the patch is in and hit the original `.tolist()` cudagraph crash this script exists to prevent. Fixed in [`c34bbf1`](https://github.com/noonghunna/qwen36-27b-single-3090/commit/c34bbf1) — patcher now auto-discovers vLLM via `import vllm` (handles `dist-packages`/`site-packages` automatically) and uses single-line regex anchors that survive nightly-to-nightly churn. Tested on current `vllm/vllm-openai:nightly`. Bug reported by [@3dluvr](https://github.com/3dluvr) in [#1](https://github.com/noonghunna/qwen36-27b-single-3090/issues/1) on `0.19.2rc1.dev209+g60cd878a3` (non-docker site-packages layout).
+
 ---
 
 ## Requirements
