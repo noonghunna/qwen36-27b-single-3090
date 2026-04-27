@@ -32,7 +32,15 @@ services:
       - "8020:8000"
     volumes:
       - ${MODEL_DIR:-../models}:/root/.cache/huggingface
-      - ../patches/genesis/patch_genesis_unified.py:/patches/patch_genesis_unified.py:ro
+      # Genesis v7.14+ modular package (mounted into vLLM's site-packages).
+      # Replaces the old patch_genesis_unified.py shim path which Sandermage
+      # removed when migrating to the modular layout. Apply via
+      # `python3 -m vllm._genesis.patches.apply_all` at boot.
+      - ../patches/genesis/vllm/_genesis:/usr/local/lib/python3.12/dist-packages/vllm/_genesis:ro
+      # Standalone .tolist() cudagraph capture-guard fix (separate bug from
+      # any single Genesis patch). Equivalent functionality also ships as
+      # Genesis P78 since v7.14 (with attribution); both running together
+      # is harmless (idempotent), running just one is sufficient.
       - ../patches/patch_tolist_cudagraph.py:/patches/patch_tolist_cudagraph.py:ro
     environment:
       # Uncomment the next line to pin to a specific GPU (e.g. GPU 0):
@@ -50,6 +58,12 @@ services:
       - CUDA_DEVICE_MAX_CONNECTIONS=8
       - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
       - VLLM_MARLIN_USE_ATOMIC_ADD=1
+      # Genesis v7.14+ opt-in patches relevant to fp8 KV + MTP path.
+      # We don't enable P4 (TurboQuant-hybrid) — fp8 KV doesn't need it.
+      # We don't enable P65/P67 — fp8 KV doesn't trigger #40880 cudagraph bug.
+      - GENESIS_ENABLE_P64_QWEN3CODER_MTP_STREAMING=1
+      - GENESIS_ENABLE_P68_AUTO_FORCE_TOOL=1
+      - GENESIS_ENABLE_P69_LONG_CTX_TOOL_REMINDER=1
     shm_size: "16gb"
     ipc: host
     deploy:
@@ -64,8 +78,8 @@ services:
       - -c
       - |
         set -e
-        pip install xxhash -q
-        python3 /patches/patch_genesis_unified.py
+        pip install xxhash pandas scipy -q
+        python3 -m vllm._genesis.patches.apply_all
         python3 /patches/patch_tolist_cudagraph.py
         exec vllm serve "$@"
       - --
