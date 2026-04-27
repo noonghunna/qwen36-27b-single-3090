@@ -20,7 +20,7 @@ Six configurations, all functional. Pick by workload — there's a real per-stre
 | **Tools-text** (`docker-compose.tools-text.yml`) — fp8 + 75K | 75K | 65 / 85 | ❌ | ✅ | Genesis | Drops vision to free KV pool. fp8 KV — bug doesn't fire. |
 | **Legacy long-ctx** (`docker-compose.longctx-experimental.yml`) — TurboQuant + cudagraph_mode=NONE | 125K | ~33 | ✅ | ✅ | Genesis | TurboQuant 3-bit. Ships `cudagraph_mode=NONE` workaround → -65% TPS, full correctness. |
 | **v7.14** (`docker-compose.v714.yml`) — TurboQuant + Genesis v7.14 P65 ⭐ | 32K | 55-72 | ✅ | ✅ | Genesis v7.14+ | Surgical workaround. P65 auto-downgrades cudagraph for spec-decode only. -25% from old fast path. |
-| **Eager** (`docker-compose.eager.yml`) — `--enforce-eager` + 125K + tools | 125K | 52-65 | ✅ | ✅ | **none** | No spec-decode bug class because no cudagraph to capture. Sweet spot for "spec-decode + 125K + tools without the patch tree". Suggested by [@ampersandru](https://github.com/ampersandru) in [#1](https://github.com/noonghunna/qwen36-27b-single-3090/issues/1). |
+| **Eager** (`docker-compose.eager.yml`) — TurboQuant + MTP + `--enforce-eager` + 125K | 125K | 52-65 | ✅ | ✅ | Genesis P4 only | TurboQuant 3-bit KV + spec-decode + tools at 125K, but `--enforce-eager` bypasses the cudagraph capture path so #40880 never fires. Needs Genesis P4 (TurboQuant-on-hybrid support); doesn't need P65/P67. Suggested by [@ampersandru](https://github.com/ampersandru) in [#1](https://github.com/noonghunna/qwen36-27b-single-3090/issues/1). |
 | **Minimal** (`docker-compose.minimal.yml`) — no spec-decode, fp8 KV | 32K | ~30 | ✅ | ✅ | **none** | Simplest stack. No spec-decode → no #40880 trigger → no patches needed. ~30 TPS but rock-solid, every feature works. Pick when stability > peak TPS. |
 | ~~**Old fast path**~~ — TurboQuant + FULL cudagraph | ~~125K~~ | ~~92-95~~ | ✅ | **✗ silently broken** | n/a | Not shipped as a compose. Tool calls produce `<tool_call>` cascade. Hidden from plain TPS measurement. |
 
@@ -28,7 +28,7 @@ Six configurations, all functional. Pick by workload — there's a real per-stre
 
 - **Want simplest possible stack, no patches, no fuss?** → **Minimal**. ~30 TPS, every feature works, zero risk.
 - **Need 20K ctx, full features, max TPS?** → Default. No reason to look further.
-- **Need 125K ctx + tools but want zero-patch simplicity?** → **Eager** (`--enforce-eager`, no Genesis tree, ~52–65 TPS at 125K).
+- **Need 125K ctx + tools at decent TPS, OK with Genesis (P4 only)?** → **Eager** (`--enforce-eager` + TurboQuant, ~52–65 TPS at 125K — uses Genesis but bypasses the cudagraph bug class via eager mode).
 - **Need 32K ctx + tools at peak TPS, OK with patch tree?** → **v7.14** (Genesis P65, 55–72 TPS at 32K).
 - **Need 125K ctx + tool calls, OK with very low TPS?** → Legacy long-ctx (`cudagraph_mode=NONE`).
 - **Need 75K ctx + tools but no vision?** → Tools-text.
@@ -49,6 +49,7 @@ This is a workaround. The proper fix is a custom multi-query Triton kernel (P67)
 
 ### Recently fixed
 
+- **2026-04-27** — `docker-compose.eager.yml` initial commit incorrectly claimed "no Genesis patches needed" while still using `--kv-cache-dtype turboquant_3bit_nc`, which raises `NotImplementedError: TurboQuant KV cache is not supported for hybrid (attention + Mamba) models` on Qwen3.6's hybrid DeltaNet layout without the Genesis P4 patch. Updated the compose to mount the Genesis tree (P4 only — still skips P65/P67 since `--enforce-eager` bypasses the cudagraph path entirely) and corrected the README to reflect the dependency. Reported by [@walmis](https://github.com/walmis) in [#5](https://github.com/noonghunna/qwen36-27b-single-3090/issues/5).
 - **2026-04-27** — `patches/patch_tolist_cudagraph.py` was silently failing on (a) any non-docker setup (hardcoded `dist-packages` path) and (b) any vLLM nightly past the one we initially tested against (multi-line block anchors fragile against upstream rewording). Symptom: patcher logs "anchor NOT FOUND" but doesn't fail-stop, so users boot vLLM thinking the patch is in and hit the original `.tolist()` cudagraph crash this script exists to prevent. Fixed in [`c34bbf1`](https://github.com/noonghunna/qwen36-27b-single-3090/commit/c34bbf1) — patcher now auto-discovers vLLM via `import vllm` (handles `dist-packages`/`site-packages` automatically) and uses single-line regex anchors that survive nightly-to-nightly churn. Tested on current `vllm/vllm-openai:nightly`. Bug reported by [@3dluvr](https://github.com/3dluvr) in [#1](https://github.com/noonghunna/qwen36-27b-single-3090/issues/1) on `0.19.2rc1.dev209+g60cd878a3` (non-docker site-packages layout).
 
 ---

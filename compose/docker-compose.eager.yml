@@ -1,24 +1,36 @@
 # ===========================================================================
-# Eager — spec-decode + 125K ctx + tools, no Genesis patches needed.
+# Eager — TurboQuant + MTP + 125K ctx + tools + Genesis (P4) but `--enforce-eager`.
 #
-# This variant is the "no-patch-tree" path: same TurboQuant + MTP + vision +
-# tool-call coverage as the v7.14 default, but bypasses every cudagraph-related
-# bug class by disabling cudagraph entirely (`--enforce-eager`).
+# This variant is the "ampersandru sweet-spot" path from single-3090 issue #1:
+# v7.14's TurboQuant KV + Genesis patches that handle hybrid attention,
+# combined with `--enforce-eager` to bypass the entire cudagraph-capture
+# bug class (#40880) without needing P65's PIECEWISE downgrade.
 #
-# Trade-off vs `docker-compose.v714.yml` (the patched path):
-#   - This: ~52-65 TPS at 125K ctx, no Genesis tree to maintain, simpler stack
-#   - v7.14: ~85 TPS at 32K ctx with Genesis P65 PIECEWISE (faster but patch-heavy)
+# What you get:
+#   ~52-65 TPS at 125K ctx · MTP n=3 spec-decode · vision · tool calls · long ctx
 #
-# Why it works without any patches:
-#   - vllm#40880's tool-call cascade only manifests during cudagraph capture of
-#     the K+1 spec-verify path. With `--enforce-eager`, vLLM never captures any
-#     cudagraph at all, so the bug can't fire.
-#   - You give up cudagraph speedup (~20% per token typically) but keep MTP's
-#     ~3× spec-decode acceptance rate, so net throughput stays well above the
-#     no-spec-decode minimal compose.
+# Trade-off vs `docker-compose.v714.yml` (P65 PIECEWISE path):
+#   - This: ~52-65 TPS at 125K, simpler reasoning (no cudagraph at all)
+#   - v7.14: ~85 TPS at 32K with Genesis P65 (faster but lower max ctx)
 #
-# Credit: this variant was suggested by @ampersandru in single-3090 issue #1
-# after they hit the tool-call cascade on the unpatched default compose.
+# Why Genesis is still required despite "eager":
+#   `--enforce-eager` only disables cudagraph; it does NOT remove the
+#   underlying need for TurboQuant on hybrid (DeltaNet + attention) models.
+#   The P4 patch in Genesis adds TurboQuant support for hybrid layouts —
+#   without it, vLLM raises:
+#     NotImplementedError: TurboQuant KV cache is not supported for hybrid
+#     (attention + Mamba) models.
+#
+# Patches that ARE needed:
+#   - P4 (TurboQuant hybrid support) — required, otherwise boot fails
+#   - P64/P66/P68/P69 — quality-of-life
+#   - P78 — capture guard (no-op when --enforce-eager but harmless)
+# Patches NOT needed (eager bypasses their purpose):
+#   - P65 (cudagraph downgrade for spec-decode)
+#   - P67 (multi-query Triton kernel for cudagraph capture)
+#
+# Credit: variant suggested by @ampersandru in single-3090 issue #1 after
+# they hit the tool-call cascade on the unpatched default compose.
 #
 # Run:
 #   cd compose && docker compose -f docker-compose.eager.yml up -d
@@ -32,6 +44,10 @@ services:
       - "8020:8000"
     volumes:
       - ${MODEL_DIR:-../models}:/root/.cache/huggingface
+      # Genesis v7.14+ modular package (P4 TurboQuant-hybrid is the load-
+      # bearing patch; without it, --kv-cache-dtype turboquant_3bit_nc fails
+      # at engine init on Qwen3.6's hybrid DeltaNet + standard-attention layout).
+      - ../patches/genesis/vllm/_genesis:/usr/local/lib/python3.12/dist-packages/vllm/_genesis:ro
     environment:
       # Uncomment the next line to pin to a specific GPU (e.g. GPU 0):
       # - CUDA_VISIBLE_DEVICES=0
@@ -43,7 +59,15 @@ services:
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512
       - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
       - VLLM_USE_FLASHINFER_SAMPLER=1
+      - VLLM_MARLIN_USE_ATOMIC_ADD=1
       - OMP_NUM_THREADS=1
+      # Genesis v7.14+ opt-in patches:
+      # P4 IS required (turboquant_3bit_nc on hybrid model)
+      # P65 NOT enabled — --enforce-eager bypasses the cudagraph it would patch
+      - GENESIS_ENABLE_P64_QWEN3CODER_MTP_STREAMING=1
+      - GENESIS_ENABLE_P66_CUDAGRAPH_SIZE_FILTER=1
+      - GENESIS_ENABLE_P68_AUTO_FORCE_TOOL=1
+      - GENESIS_ENABLE_P69_LONG_CTX_TOOL_REMINDER=1
     shm_size: "16gb"
     ipc: host
     deploy:
@@ -53,6 +77,15 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+        pip install xxhash pandas scipy -q
+        python3 -m vllm._genesis.patches.apply_all
+        exec vllm serve "$@"
+      - --
     command:
       - --model
       - /root/.cache/huggingface/qwen3.6-27b-autoround-int4
