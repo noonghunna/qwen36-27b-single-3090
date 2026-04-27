@@ -14,15 +14,18 @@
 #
 # Trade-off vs the old fast path:
 #   - Tool calls now WORK (was silently broken — `<tool_call>` cascade)
-#   - Per-stream TPS regresses ~25%: 55-72 TPS at 32K vs old 92-95 TPS at 125K
-#   - max-model-len had to drop to 32K on consumer 24 GB to leave activation
-#     headroom (eager continuation needs more VRAM than FULL cudagraph did)
+#   - 51 narrative / 68 code TPS sustained across 32K → 65K → 90K → 125K → 192K
 #
-# Pick this variant if you need WORKING TOOL CALLS on a single 3090 with
-# spec-decode. If you only need plain chat / code generation without tools,
-# the old `docker-compose.yml` (FULL cudagraph) is faster — but verify with
-# `bash scripts/verify-full.sh` that your workload doesn't trigger the
-# cascade bug.
+# Context ceiling on dev205 + Genesis v7.54 (verified 2026-04-27):
+#   - 192K fits at gpu-memory-utilization=0.98 (engine reports 3.31 GiB KV,
+#     22.3 GB total VRAM at peak)
+#   - 200K OOMs (KV needs 3.31 GiB, only 3.05 GiB available at 0.97)
+#   - Earlier "32K cap" comment in this header was stale — Genesis v7.54 +
+#     dev205 nightly has tighter activation footprint than older substrate
+#
+# This variant is now the recommended path for ALL contexts up to 192K. It
+# obsoletes the older `docker-compose.longctx-experimental.yml` (38/50 TPS at
+# 125K via cudagraph_mode=NONE) which is now strictly slower at lower ctx.
 #
 # Variant matrix:
 #
@@ -41,7 +44,7 @@
 # ===========================================================================
 services:
   vllm-qwen36-27b:
-    image: vllm/vllm-openai:nightly-100c7b65e7579c8caf4ee0b04a6410b2796b905c
+    image: vllm/vllm-openai:nightly-07351e0883470724dd5a7e9730ed10e01fc99d08
     container_name: vllm-qwen36-27b
     restart: "no"
     ports:
@@ -54,7 +57,7 @@ services:
       # Standalone .tolist() cudagraph capture fix — separate bug from P65.
       # Different bug class: P65 fixes cu_seqlens_k=cu_seqlens_q misclassification;
       # this fix guards .tolist() syscalls during capture.
-      - ../patches/genesis/patch_tolist_cudagraph.py:/patches/patch_tolist_cudagraph.py:ro
+      - ../patches/patch_tolist_cudagraph.py:/patches/patch_tolist_cudagraph.py:ro
     environment:
       # Uncomment the next line to pin to a specific GPU (e.g. GPU 0):
       # - CUDA_VISIBLE_DEVICES=0
@@ -111,18 +114,24 @@ services:
       - "1"
       # 32K — this is the practical ceiling on consumer 24 GB Ampere with
       # v7.14's eager spec-verify. The old longctx-experimental compose hit
-      # 125K because FULL cudagraph captured activation tensors once and
-      # reused them; v7.14's PIECEWISE re-allocates each call → less ctx room.
+      # 192K is the empirical ceiling at TQ3 + 0.98 mem-util on a 24 GB 3090
+      # with dev205 vLLM + Genesis v7.54. Engine reports max ~177504 at 0.97;
+      # bumping to 0.98 frees enough KV for 192000 to clear the pre-check.
+      # 200K OOMs at boot (3.31 GiB KV needed, only 3.05 GiB available at 0.97).
       - --max-model-len
-      - "32768"
+      - "192000"
       - --gpu-memory-utilization
-      - "0.92"
+      - "0.98"
       - --max-num-seqs
       - "1"
       - --max-num-batched-tokens
       - "4128"
       - --kv-cache-dtype
       - turboquant_3bit_nc
+      # For maximum context (205K instead of 192K), uncomment the next line
+      # to drop the vision tower. Frees ~1 GB VRAM, lifts engine ceiling
+      # from 192K to ~206K. Trade-off: text-only.
+      #- --language-model-only
       - --trust-remote-code
       - --reasoning-parser
       - qwen3
@@ -134,10 +143,10 @@ services:
       - --no-scheduler-reserve-full-isl
       - --speculative-config
       - '{"method":"mtp","num_speculative_tokens":3}'
-      # cudagraph_mode is NOT forced here. Genesis v7.14 P65 auto-downgrades
-      # FULL_AND_PIECEWISE → PIECEWISE for spec-decode at runtime. 1-token
-      # decode batches still get cudagraph capture; only K+1 spec-verify
-      # batches go eager.
+      # cudagraph_mode left at vLLM default. Genesis v7.14 P65 auto-downgrades
+      # FULL_AND_PIECEWISE → PIECEWISE for spec-decode K+1 verify; 1-token
+      # decode batches still get cudagraph capture. Forcing FULL_AND_PIECEWISE
+      # explicitly produces no measurable benefit (verified 2026-04-27).
       - --host
       - 0.0.0.0
       - --port

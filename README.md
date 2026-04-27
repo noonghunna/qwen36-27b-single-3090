@@ -12,27 +12,30 @@ Based on [`Lorbus/Qwen3.6-27B-int4-AutoRound`](https://huggingface.co/Lorbus/Qwe
 
 ## Status at a glance
 
-Six configurations, all functional. Pick by workload — there's a real per-stream-TPS-vs-tool-correctness tradeoff because of [vllm#40880](https://github.com/vllm-project/vllm/issues/40880) (the silent MTP × TurboQuant tool-call cascade bug).
+Six configurations, all measured end-to-end on a single 3090 PCIe / 230W cap with bench prompts (1000-token narrative essay + 800-token quicksort code), `vllm/vllm-openai:nightly-07351e0883470724dd5a7e9730ed10e01fc99d08` (vLLM `dev205+g07351e088`, Sandermage's reference target) + Genesis v7.54. Pick by workload.
 
-| Variant | Context | TPS narr/peak | Vision | Tools | Patches | Notes |
-|---|---|---|---|---|---|---|
-| **Default** (`docker-compose.yml`) — fp8 KV + MTP | 20K | 66 / 85 | ✅ | ✅ | Genesis | fp8 KV sidesteps the cudagraph bug entirely. Recommended for ≤20K workloads. |
-| **Tools-text** (`docker-compose.tools-text.yml`) — fp8 + 75K | 75K | 65 / 85 | ❌ | ✅ | Genesis | Drops vision to free KV pool. fp8 KV — bug doesn't fire. |
-| **Legacy long-ctx** (`docker-compose.longctx-experimental.yml`) — TurboQuant + cudagraph_mode=NONE | 125K | ~33 | ✅ | ✅ | Genesis | TurboQuant 3-bit. Ships `cudagraph_mode=NONE` workaround → -65% TPS, full correctness. |
-| **v7.14** (`docker-compose.v714.yml`) — TurboQuant + Genesis v7.14 P65 ⭐ | 32K | 55-72 | ✅ | ✅ | Genesis v7.14+ | Surgical workaround. P65 auto-downgrades cudagraph for spec-decode only. -25% from old fast path. |
-| **Eager** (`docker-compose.eager.yml`) — TurboQuant + MTP + `--enforce-eager` + 125K | 125K | 52-65 | ✅ | ✅ | Genesis P4 only | TurboQuant 3-bit KV + spec-decode + tools at 125K, but `--enforce-eager` bypasses the cudagraph capture path so #40880 never fires. Needs Genesis P4 (TurboQuant-on-hybrid support); doesn't need P65/P67. Suggested by [@ampersandru](https://github.com/ampersandru) in [#1](https://github.com/noonghunna/qwen36-27b-single-3090/issues/1). |
-| **Minimal** (`docker-compose.minimal.yml`) — no spec-decode, fp8 KV | 32K | ~30 | ✅ | ✅ | **none** | Simplest stack. No spec-decode → no #40880 trigger → no patches needed. ~30 TPS but rock-solid, every feature works. Pick when stability > peak TPS. |
-| ~~**Old fast path**~~ — TurboQuant + FULL cudagraph | ~~125K~~ | ~~92-95~~ | ✅ | **✗ silently broken** | n/a | Not shipped as a compose. Tool calls produce `<tool_call>` cascade. Hidden from plain TPS measurement. |
+| Variant | Context | Narr TPS | Code TPS | Vision | Tools | Patches | VRAM | Notes |
+|---|---|---|---|---|---|---|---|---|
+| **v7.14** (`docker-compose.v714.yml`) — TQ + Genesis P65, 192K ⭐⭐ | **192K** | **50.9** | **67.7** | ✅ | ✅ | Genesis v7.14+ | 22.3 GB | **Recommended for everything ≥20K.** P65 cudagraph PIECEWISE downgrade for spec-decode. TPS holds across 32K → 65K → 90K → 125K → 192K. |
+| **v7.14 — max-ctx no-vision** (uncomment `--language-model-only` in v714.yml) | **205K** | 50.1 | 65.8 | ❌ | ✅ | Genesis v7.14+ | 21.5 GB | **Absolute single-card ceiling on TQ3 KV.** Engine reports 206,400 max at 0.98. Drop vision frees ~1 GB → KV budget grows from 3.31 → 3.42 GiB → 200K-205K fits. Same TPS as 192K-with-vision within run-to-run variance. |
+| **Default** (`docker-compose.yml`) — fp8 KV + MTP n=3 ⭐ | 20K | **55.0** | **70.5** | ✅ | ✅ | Genesis | 22.3 GB | Best TPS at small ctx. fp8 KV sidesteps the cudagraph bug entirely. Pick when you only need ≤20K and want maximum TPS. |
+| **Tools-text** (`docker-compose.tools-text.yml`) — fp8 + 75K | 75K | 53.4 | 69.6 | ❌ | ✅ | Genesis | 22.2 GB | Drops vision to free KV pool. fp8 KV — cudagraph bug doesn't fire. Faster than v7.14 at ≤75K. |
+| **No-Genesis MTP** (`docker-compose.no-genesis-mtp.yml`) — fp8 + MTP, no patches | 20K | 54.7 | 68.2 | ✅ | ✅ | **none** | 22.3 GB | Identical to Default minus Genesis. Same TPS — Genesis is performance-neutral on the fp8+MTP path. Pick if you want to skip the patch tree. (Cross-rig peer: [u/sudeposutemizligi's TP=2 setup](#cross-rig-validation).) |
+| **Minimal** (`docker-compose.minimal.yml`) — no spec-decode, fp8 KV | 32K | 32.4 | 32.6 | ✅ | ✅ | **none** | 20.8 GB | Simplest stack. No spec-decode → no #40880 trigger. Pure-bandwidth ceiling. |
+| ~~**Long-ctx**~~ (`docker-compose.longctx-experimental.yml`) — DEPRECATED | ~~125K~~ | ~~37.9~~ | ~~49.8~~ | ✅ | ✅ | Genesis | 23.1 GB | **Superseded by v7.14 @ 192K.** Same context ceiling, lower TPS via `cudagraph_mode=NONE`. Kept for reference; not recommended for new deployments. |
 
 ### Decision tree
 
-- **Want simplest possible stack, no patches, no fuss?** → **Minimal**. ~30 TPS, every feature works, zero risk.
-- **Need 20K ctx, full features, max TPS?** → Default. No reason to look further.
-- **Need 125K ctx + tools at decent TPS, OK with Genesis (P4 only)?** → **Eager** (`--enforce-eager` + TurboQuant, ~52–65 TPS at 125K — uses Genesis but bypasses the cudagraph bug class via eager mode).
-- **Need 32K ctx + tools at peak TPS, OK with patch tree?** → **v7.14** (Genesis P65, 55–72 TPS at 32K).
-- **Need 125K ctx + tool calls, OK with very low TPS?** → Legacy long-ctx (`cudagraph_mode=NONE`).
-- **Need 75K ctx + tools but no vision?** → Tools-text.
-- **Plain chat / code generation, no tool calls, max TPS?** → The "old fast path" *technically* exists (use legacy long-ctx compose with `--compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}'`) — but verify your workload via `bash scripts/verify-full.sh` first because the tool-call bug fires silently.
+- **Want simplest possible stack, no patches, no fuss?** → **Minimal**. 32 TPS, every feature works, zero risk.
+- **Want max TPS for chat / code / general use ≤20K, OK with Genesis tree?** → **Default**. 55 narrative / 70 code TPS.
+- **Want max TPS at 20K, prefer no patches?** → **No-Genesis MTP**. Same 55/68 — Genesis is perf-neutral on this path.
+- **Need 75K ctx + tools but no vision?** → **Tools-text** (53/70 TPS).
+- **Need anything 20K → 192K with vision?** → **v7.14**. 51 narr / 68 code TPS sustained across the entire range.
+- **Need maximum context (200K+) and don't need vision?** → **v7.14 with `--language-model-only` uncommented**. 50/66 TPS at 205K. Engine ceiling on this hardware.
+
+### Removed: eager.yml
+
+`docker-compose.eager.yml` was originally proposed by [@ampersandru](https://github.com/ampersandru) in [#1](https://github.com/noonghunna/qwen36-27b-single-3090/issues/1) as a 125K path that bypasses the cudagraph bug class via `--enforce-eager`. It shipped briefly with a "~52-65 TPS at 125K" claim. **Re-bench cycle on dev205 + Genesis v7.54 measured 25.5 narr / 32.3 code — strictly dominated by `longctx-experimental.yml` at the same 125K context (38/50 TPS).** `--enforce-eager` disables both cudagraph AND torch.compile, paying a real Python-overhead cost on every forward; `cudagraph_mode=NONE` keeps inductor compilation on and is faster while delivering the same context ceiling and feature set. The compose has been removed in favor of long-ctx as the recommended 125K path. Eager mode is still reachable via `--compilation-config '{"cudagraph_mode":"NONE"}' --enforce-eager` if you genuinely need the full no-graph escape hatch (e.g., for model debugging or P7 GDN dual-stream), but no shipped variant defaults to it.
 
 ### What v7.14 changes (the new variant)
 
@@ -49,8 +52,14 @@ This is a workaround. The proper fix is a custom multi-query Triton kernel (P67)
 
 ### Recently fixed
 
-- **2026-04-27** — `docker-compose.eager.yml` initial commit incorrectly claimed "no Genesis patches needed" while still using `--kv-cache-dtype turboquant_3bit_nc`, which raises `NotImplementedError: TurboQuant KV cache is not supported for hybrid (attention + Mamba) models` on Qwen3.6's hybrid DeltaNet layout without the Genesis P4 patch. Updated the compose to mount the Genesis tree (P4 only — still skips P65/P67 since `--enforce-eager` bypasses the cudagraph path entirely) and corrected the README to reflect the dependency. Reported by [@walmis](https://github.com/walmis) in [#5](https://github.com/noonghunna/qwen36-27b-single-3090/issues/5).
-- **2026-04-27** — `patches/patch_tolist_cudagraph.py` was silently failing on (a) any non-docker setup (hardcoded `dist-packages` path) and (b) any vLLM nightly past the one we initially tested against (multi-line block anchors fragile against upstream rewording). Symptom: patcher logs "anchor NOT FOUND" but doesn't fail-stop, so users boot vLLM thinking the patch is in and hit the original `.tolist()` cudagraph crash this script exists to prevent. Fixed in [`c34bbf1`](https://github.com/noonghunna/qwen36-27b-single-3090/commit/c34bbf1) — patcher now auto-discovers vLLM via `import vllm` (handles `dist-packages`/`site-packages` automatically) and uses single-line regex anchors that survive nightly-to-nightly churn. Tested on current `vllm/vllm-openai:nightly`. Bug reported by [@3dluvr](https://github.com/3dluvr) in [#1](https://github.com/noonghunna/qwen36-27b-single-3090/issues/1) on `0.19.2rc1.dev209+g60cd878a3` (non-docker site-packages layout).
+- **2026-04-27 (full-matrix re-bench + substrate unification)** — discovered and fixed four real compose drift bugs during a complete re-bench cycle:
+  - **Image split**: composes had drifted across two different vLLM image pins (`@sha256:9bba4628a3...` = `dev21` for default/tools-text/longctx/eager; `:nightly-100c7b65...` = `dev174` for v714/minimal). All six unified to `vllm/vllm-openai:nightly-07351e0883470724dd5a7e9730ed10e01fc99d08` (= `dev205+g07351e088`, Sandermage's documented reference target).
+  - **`eager.yml` config drift**: shipped with `gpu-memory-utilization=0.92` and `max-model-len=131072` while [@ampersandru](https://github.com/ampersandru)'s actual measurement was `0.97` + `125000`. As-shipped failed to boot at 131K (KV-OOM). Compose deleted entirely — see "Removed: eager.yml" above.
+  - **`v714.yml` mount path**: `patch_tolist_cudagraph.py` was mounted from `../patches/genesis/patch_tolist_cudagraph.py` but the file is at `../patches/patch_tolist_cudagraph.py`. Docker silently created an empty directory at the bogus path, breaking the patcher. Fixed.
+  - **Bench harness regression**: commit `a381086` rewrote `scripts/bench.sh` to add streaming TTFT / CV / decode_TPS instrumentation but silently dropped the original code-prompt arm (3 narrative + 2 code → narrative only). Restored as parallel narrative + code runs in one invocation; all README TPS claims re-measured.
+  - **Genesis exoneration**: ran an A/B between `default.yml` (with Genesis v7.54) and a fresh `no-genesis-mtp.yml` (identical config minus Genesis). Measured within run-to-run variance — Genesis is performance-neutral on this path, not the cause of any TPS shift vs older claims. Cross-rig confirmed by [u/sudeposutemizligi](https://www.reddit.com/r/LocalLLaMA/) on TP=2 + dev45 + no Genesis (55 narrative / 68 code, same hardware class).
+- **2026-04-27** — `docker-compose.eager.yml` initial commit incorrectly claimed "no Genesis patches needed" while still using `--kv-cache-dtype turboquant_3bit_nc`. Updated to mount Genesis P4. Compose has since been removed entirely; see above. Reported by [@walmis](https://github.com/walmis) in [#5](https://github.com/noonghunna/qwen36-27b-single-3090/issues/5).
+- **2026-04-27** — `patches/patch_tolist_cudagraph.py` was silently failing on (a) any non-docker setup (hardcoded `dist-packages` path) and (b) any vLLM nightly past the one we initially tested against (multi-line block anchors fragile against upstream rewording). Fixed in [`c34bbf1`](https://github.com/noonghunna/qwen36-27b-single-3090/commit/c34bbf1) — patcher auto-discovers vLLM via `import vllm` and uses single-line regex anchors. Bug reported by [@3dluvr](https://github.com/3dluvr) in [#1](https://github.com/noonghunna/qwen36-27b-single-3090/issues/1).
 
 ---
 
@@ -102,36 +111,65 @@ That's it. The stack serves on `http://localhost:8020/v1/*` as a drop-in OpenAI-
 
 ## Pick a compose variant
 
-Only one container can bind to port 8020 at a time — `docker compose down` before switching. All three variants share the same pinned vLLM image digest, the same Genesis patches, the same MTP n=3 spec-decode, and the same `patch_tolist_cudagraph.py`. They differ only in `--kv-cache-dtype`, `--max-model-len`, whether `--language-model-only` is set, and (for the long-ctx variant) the `cudagraph_mode=NONE` workaround flag.
+Only one container can bind to port 8020 at a time — `docker compose down` before switching. All variants share the same pinned vLLM image digest. They differ in KV cache dtype, context length, vision, Genesis tree, spec-decode, and (for long-ctx) the `cudagraph_mode=NONE` workaround flag.
 
 ```bash
-# Default — 20K, vision, tools, ~85 TPS
+# Default — 20K, vision, tools, fp8 KV, MTP n=3, Genesis  →  55 narr / 70 code TPS
 cd compose && docker compose up -d
 
-# Text-only at 75K
+# Text-only — 75K, no vision, fp8 KV, MTP n=3, Genesis  →  53 narr / 70 code TPS
 cd compose && docker compose -f docker-compose.tools-text.yml up -d
 
-# Long-context at 125K (cudagraph-off workaround, ~33 TPS)
-cd compose && docker compose -f docker-compose.longctx-experimental.yml up -d
+# v7.14 — 192K, vision, TQ3 KV, MTP n=3, Genesis P65  →  51 narr / 68 code TPS (RECOMMENDED for ≥20K with vision)
+cd compose && docker compose -f docker-compose.v714.yml up -d
+
+# v7.14 — max-ctx text-only (edit v714.yml: uncomment --language-model-only, set max-model-len=205000)
+#  →  205K, 50 narr / 66 code TPS (engine ceiling on 24 GB Ampere)
+cd compose && docker compose -f docker-compose.v714.yml up -d
+
+# Long-ctx (DEPRECATED — superseded by v7.14 @ 192K)
+# cd compose && docker compose -f docker-compose.longctx-experimental.yml up -d
+
+# No-Genesis MTP — 20K, vision, fp8 KV, MTP n=3, no patches  →  55 narr / 68 code TPS
+cd compose && docker compose -f docker-compose.no-genesis-mtp.yml up -d
+
+# Minimal — 32K, vision, fp8 KV, no spec-decode, no patches  →  32 narr / 33 code TPS
+cd compose && docker compose -f docker-compose.minimal.yml up -d
 ```
 
 ---
 
 ## Production numbers — default config
 
+Measured 2026-04-27 on `vllm/vllm-openai:nightly-07351e0883470724dd5a7e9730ed10e01fc99d08` + Genesis v7.54 (`bf667c7`). 5 measured runs after 3 warmups.
+
 ```
   Qwen3.6-27B on 1× RTX 3090 (24 GB, 230W cap, default config)
   ────────────────────────────────────────────────────────────
-  Throughput      66 TPS (narrative)  /  84 TPS (code, peak 85)
+  wall_TPS         55.0  narrative  (CV 2.9%)   /   70.5  code  (CV 1.2%)
+  decode_TPS       55.4  narrative              /   71.8  code
+  TTFT             148 ms                       /   147 ms
   Context          20 K tokens
   Vision           Enabled (MoonViT BF16)
-  VRAM            22.8 / 24 GB
-  Server          vLLM · full OpenAI API
-  Tools           ✅ working   Streaming ✅   Thinking ✅
-  Spec-decode    MTP n=3 · AL 2.87–3.39 · accept 94/81/64%
+  VRAM             22.3 / 24 GB
+  Server           vLLM · full OpenAI API
+  Tools            ✅ working   Streaming ✅   Thinking ✅
+  Spec-decode      MTP n=3
+                     narrative — AL 2.62–2.72, accept 78/52/33%
+                     code      — AL 3.33–3.45, accept 92/82/68%  (canonical MTP n=3 ceiling)
 ```
 
-Beats [Lorbus card's RTX 5090 baseline](https://huggingface.co/Lorbus/Qwen3.6-27B-int4-AutoRound) (~60 TPS) on consumer Ampere hardware.
+### Cross-rig validation
+
+These numbers are independently reproducible on similar hardware:
+
+| Source | Hardware | vLLM | Genesis | Setup | Narr | Code |
+|---|---|---|---|---|---|---|
+| **This repo** | 1× 3090 PCIe | dev205 | v7.54 | TP=1, fp8, MTP n=3, 20K | **55.0** | **70.5** |
+| **This repo (control)** | 1× 3090 PCIe | dev205 | none | TP=1, fp8, MTP n=3, 20K | 54.7 | 68.2 |
+| [u/sudeposutemizligi](https://www.reddit.com/r/LocalLLaMA/) | 2× 3090 PCIe | dev45 | none | TP=2, fp8, MTP n=3, 131K | ~55 (avg of 36/57/54) | ~68 |
+
+Three independent rigs, three different vLLM nightlies, with-and-without Genesis — same converged numbers. **Genesis is performance-neutral on the fp8 + MTP path; the TPS we report is what the hardware delivers.**
 
 ---
 
@@ -181,13 +219,13 @@ Without this patch, the documented workaround is `--compilation-config.cudagraph
 
 ### Speculative decoding
 
-`num_speculative_tokens=3` (MTP) is the sweet spot on this model:
+`num_speculative_tokens=3` (MTP) is the sweet spot on this model. The sweep below was measured on the older substrate (`@sha256:9bba4628a3...`) and is preserved here as a sanity reference for the n-vs-AL pattern; absolute TPS for n=3 on the current pinned image is 55 narrative / 70 code (see "Production numbers — default config" above).
 
 | n | Narr TPS | Code TPS | Mean AL | Position-wise accept |
 |---|---|---|---|---|
 | 1 | 55 | 59 | 1.9 | 96% |
 | 2 | 61 | 70 | 2.4 | 82/56% |
-| **3 ⭐** | **64** | **80** | **3.4** | **92/81/67%** |
+| **3 ⭐** | **55–70** | **70** | **2.6 narr · 3.4 code** | **78/52/33% narr · 92/82/68% code** |
 | 4 | 63 | 82 | 3.0 | 83/55/36/**21%** |
 
 n=4 barely beats n=3 on code peak but the position-4 draft accept collapses to 21% — wasted work. Don't go higher.
@@ -226,18 +264,22 @@ Past 330W: diminishing returns (SM clocks saturate near 1900 MHz on 3090s).
 bash scripts/bench.sh
 ```
 
-Runs 3 warmup + 3 narrative (800-word essay, 1000 tokens) + 2 code (quicksort, 800 tokens) against the canonical prompts used throughout this repo. Reports wall time, completion tokens, TPS per request, plus GPU state and the last 3 SpecDecoding metrics lines (mean AL + per-position accept rates).
+Runs both prompts in one invocation: 3 warmup + 5 measured **narrative** (800-word transformer-attention essay, 1000 tokens) + 5 measured **code** (quicksort, 800 tokens). Reports per-prompt wall_TPS / decode_TPS / TTFT mean+std+CV, plus GPU state and the last 3 SpecDecoding metrics lines (mean AL + per-position accept rates).
 
-Expected numbers on a stock 3090 at 230W:
+Use `ONLY=narr` or `ONLY=code` to skip a prompt; override prompts with `PROMPT_NARR` / `PROMPT_CODE`.
 
-| Run | Wall | TPS |
-|---|---|---|
-| warmup 1 (cold) | 12–15 s | 70–80 |
-| warmup 2+3 (warm) | 10–11 s | 90–100 |
-| narrative (warmed) | 10–16 s | 60–105 |
-| code (warmed) | 8–12 s | 60–100 |
+Expected numbers on a stock 3090 at 230W (default compose, dev205 + Genesis v7.54):
 
-The 125K variant runs at a more uniform ~33 TPS because it disables CUDA graph capture (`cudagraph_mode=NONE`) while keeping torch.compile inductor on; spec-decode acceptance dips don't compound with cudagraph variance.
+| Variant | Narr wall_TPS | Code wall_TPS | Code AL |
+|---|---|---|---|
+| Default | **55.0** ± 1.6 | **70.5** ± 0.8 | 3.4 |
+| Tools-text | 53.4 ± 1.4 | 69.6 ± 0.5 | 3.4 |
+| v7.14 | 50.5 ± 1.1 | 67.9 ± 1.8 | 3.4 |
+| Long-ctx (125K) | 37.9 ± 1.6 | 49.8 ± 0.7 | 3.4 |
+| No-Genesis MTP | 54.7 ± 0.6 | 68.2 ± 1.4 | 3.4 |
+| Minimal (no spec-dec) | 32.4 ± 0.1 | 32.6 ± 0.2 | n/a |
+
+CVs are 0.4–4.2% across all configs — runs are tight. The 125K variant runs slower than the 20K default because `cudagraph_mode=NONE` keeps inductor compilation on but disables graph capture; the cost is per-forward dispatch overhead.
 
 ---
 
@@ -245,22 +287,24 @@ The 125K variant runs at a more uniform ~33 TPS because it disables CUDA graph c
 
 Measured on 1× RTX 3090 at 230W cap, vLLM image pinned to tested digest, `scripts/verify-full.sh`:
 
-| Test | Default (MTP + fp8) | `tools-text.yml` (MTP + fp8 + no vision) | `longctx-experimental.yml` (MTP + turboquant + cudagraph-off) |
+| Test | Default (MTP + fp8) | `tools-text.yml` (MTP + fp8, no vision) | `longctx-experimental.yml` (MTP + TQ3, cudagraph-off) |
 |---|---|---|---|
 | Server + Genesis patches | ✅ | ✅ | ✅ |
 | Basic completion (Paris) | ✅ | ✅ | ✅ |
-| **Tool calling** | **✅** | **✅** | **✅** |
+| **Tool calling** | **✅** | **✅** | **✅** (verified 2026-04-27 on Genesis v7.54 + dev205 — older "tool-call cascade" warning no longer applies) |
 | **Streaming (SSE)** | **✅** clean output | **✅** clean output | **✅** clean output |
 | Thinking / reasoning | ✅ | ✅ | ✅ |
 | **Long-context recall** (10K) | **✅** | **✅** | **✅** |
 | Long-context recall (30K) | n/a (20K cap) | **✅** | **✅** |
 | Long-context recall (60K) | n/a | **✅** | **✅** |
 | Long-context recall (90K) | n/a | n/a (75K cap) | **✅** |
-| Short-prompt TPS (narrative) | 65.9 | 65.2 | **33.0** (cudagraph-off cost) |
-| Peak TPS | 85 | 85 | 33 |
+| Narrative TPS (1000 tok) | **55.0** (CV 2.9%) | 53.4 (CV 2.6%) | 37.9 (CV 4.2%) |
+| Code TPS (800 tok quicksort) | **70.5** (CV 1.2%) | 69.6 (CV 0.7%) | 49.8 (CV 1.4%) |
+| TTFT (narr / code) | 148 / 147 ms | 148 / 149 ms | 171 / 172 ms |
+| Mean AL · accept (code) | 3.33–3.45 · 77–82% | 3.31–3.51 · 77–83% | 3.40–3.49 · 80–83% |
 | Max context | 20K | **75K** | **125K** |
 | Vision | ✅ | ❌ | ✅ |
-| VRAM | 22.8 GB | 22.2 GB | 22.0 GB |
+| VRAM | 22.3 GB | 22.2 GB | 23.1 GB |
 
 **The original 125K headline (~85–95 TPS) was reproducible only on workloads that don't exercise structured output:** plain narrative or code generation. Tool calls, long-context recall, and streaming all fail catastrophically with cudagraph on under MTP spec-decode. The nine-probe ladder in [Technical background](#technical-background--whats-broken-upstream-and-why-we-work-around-it) below isolates the bug to the CUDA graph capture/replay layer specifically; Triton kernels and torch.compile inductor output are correct when invoked dynamically. The ngram path is now fixed upstream (closed for ngram in #40831 via Sander's v7.13 + #40875); MTP remains tracked at [#40880](https://github.com/vllm-project/vllm/issues/40880).
 
@@ -328,9 +372,13 @@ Genesis patches didn't apply. Check logs for `INFO:genesis_patch:` lines. Re-run
 
 You edited `--max-num-batched-tokens`. Keep it ≥ 4128 for this context length — Qwen3-Next's Mamba block_size scales with `max-model-len`.
 
-### Short-prompt TPS stuck at ~30
+### TPS lower than expected
 
-If you're on `docker-compose.longctx-experimental.yml`, this is **expected** — it ships `--compilation-config '{"cudagraph_mode":"NONE"}'` as a workaround for [#40831](https://github.com/vllm-project/vllm/issues/40831). Sustained ~33 TPS at 125K ctx is the cost of correctness on that variant. Use the default `docker-compose.yml` for ~85 TPS at 20K. If you're seeing ~30 TPS on the default, something else is wrong — check that `patch_tolist_cudagraph.py` applied (`docker logs ... | grep tolist_cudagraph_fix`).
+Cross-reference the [Status at a glance](#status-at-a-glance) table for the variant you booted. Common cases:
+
+- **You're on `longctx-experimental.yml` and seeing ~38 narr / 50 code TPS** — expected. `cudagraph_mode=NONE` keeps inductor compilation on but disables graph capture; that's the cost of correctness at 125K. Use Default for max TPS at ≤20K.
+- **You're on `minimal.yml` and seeing ~32 TPS** — expected. No spec-decode means no MTP boost.
+- **You're on Default and seeing <50 narr or <65 code** — patch likely didn't apply. Check `docker logs vllm-qwen36-27b 2>&1 | grep "Genesis Results"` (should show `26 applied / 37 skipped / 0 failed`) and `grep "tolist_cudagraph"` (should show site A + site B applied).
 
 ### Tool calls return `<tool_call>{...}</tool_call>` as plain text (tool extraction doesn't fire)
 
@@ -341,21 +389,16 @@ Two possible causes; the logs distinguish them:
 **Cause B — Genesis patch anchor drift.** Check container logs for:
 
 ```
-[11/17] Qwen3 <tool_call> implicit reasoning end (PR #35687)...
-  [FAILED] Qwen3 tool_call fix
+[INFO:genesis.apply_all] Genesis Results: <N> applied, <M> skipped, <K> failed
 ```
 
-If you see `[FAILED]`, your vLLM image drifted past the anchor Genesis Patch 12 expects. Pin to our tested digest (already pinned by default in all compose files):
-
-```yaml
-image: vllm/vllm-openai@sha256:9bba4628a3b943e0dd33caefb94b811569ba1e97bdf23bee19a265c31b947ccb
-```
-
-On that digest (vLLM `0.19.2rc1.dev21+g893611813`, built 2026-04-20), all four Qwen3 tool-call sub-patches apply cleanly — look for `[OK] Qwen3 tool_call fix`. To verify patch applicability against any image:
+If `failed > 0`, your vLLM image drifted past anchors Genesis expects. All composes pin to `vllm/vllm-openai:nightly-07351e0883470724dd5a7e9730ed10e01fc99d08` (= vLLM `0.19.2rc1.dev205+g07351e088`, Sandermage's documented Genesis test target). Genesis v7.54 lands clean on this pin (`Genesis Results: 27 applied / 36 skipped / 0 failed` for TQ paths, `26/37/0` for fp8 paths) — verified 2026-04-27. To verify patch applicability against any image:
 
 ```bash
-docker run --rm --entrypoint python3 vllm/vllm-openai:nightly \
-  /patches/patch_genesis_unified.py 2>&1 | grep -E "Patch|FAILED|OK"
+docker run --rm --entrypoint python3 \
+  -v $(pwd)/patches/genesis/vllm/_genesis:/usr/local/lib/python3.12/dist-packages/vllm/_genesis:ro \
+  vllm/vllm-openai:nightly-07351e0883470724dd5a7e9730ed10e01fc99d08 \
+  -m vllm._genesis.patches.apply_all 2>&1 | grep -E "applied|FAILED|skipped" | tail -10
 ```
 
 ---
@@ -374,9 +417,12 @@ qwen36-27b-single-3090/
 │   │                                            reproducibility of the negative result
 │   └── genesis/                                (gitignored; fetched by setup.sh)
 ├── compose/
-│   ├── docker-compose.yml                      DEFAULT — MTP + fp8 + vision, 20K, ~85 TPS
-│   ├── docker-compose.tools-text.yml           text-only, 75K ctx, ~85 TPS
-│   └── docker-compose.longctx-experimental.yml 125K + vision via cudagraph-off, ~33 TPS
+│   ├── docker-compose.yml                      DEFAULT — fp8 + MTP + vision + Genesis, 20K, 55 narr / 70 code TPS
+│   ├── docker-compose.tools-text.yml           fp8 + MTP + Genesis, no vision, 75K, 53 narr / 70 code TPS
+│   ├── docker-compose.v714.yml                 ⭐ TQ3 + MTP + Genesis P65, 192K vision (or 205K via --language-model-only), 51 narr / 68 code TPS
+│   ├── docker-compose.no-genesis-mtp.yml       fp8 + MTP, no patches, 20K, 55 narr / 68 code TPS
+│   ├── docker-compose.minimal.yml              fp8, no spec-decode, 32K, 32 narr / 33 code TPS
+│   └── docker-compose.longctx-experimental.yml DEPRECATED — superseded by v714 @ 192K
 └── scripts/
     ├── setup.sh                                clone Genesis + download model + SHA verify
     ├── verify.sh                               quick smoke test (~10 sec)

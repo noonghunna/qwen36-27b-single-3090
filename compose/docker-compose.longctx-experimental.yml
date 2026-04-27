@@ -58,7 +58,7 @@ services:
     # Patch 12 (Qwen3 tool_call fix) logs [FAILED] and tool calling silently
     # breaks (model emits <tool_call>...</tool_call> as plain text instead of
     # populating tool_calls[] in the API response).
-    image: vllm/vllm-openai@sha256:9bba4628a3b943e0dd33caefb94b811569ba1e97bdf23bee19a265c31b947ccb
+    image: vllm/vllm-openai:nightly-07351e0883470724dd5a7e9730ed10e01fc99d08
     container_name: vllm-qwen36-27b
     restart: "no"
     ports:
