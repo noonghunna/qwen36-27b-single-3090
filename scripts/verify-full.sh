@@ -28,8 +28,20 @@
 #                tool calls — see README "Known issue" section).
 #   SKIP_LONGCTX Set to 1 to skip the long-context test (saves ~30s and
 #                ~3GB of VRAM pressure).
+#
+# Optional flag:
+#   --bench      After all correctness checks pass, run scripts/bench.sh
+#                (3 warmup + 5 measured) to report wall_TPS / decode_TPS /
+#                TTFT mean+std+CV. Adds ~1-2 minutes.
 
 set -euo pipefail
+
+RUN_BENCH=0
+for arg in "$@"; do
+  case "$arg" in
+    --bench) RUN_BENCH=1 ;;
+  esac
+done
 
 URL="${URL:-http://localhost:8020}"
 MODEL="${MODEL:-qwen3.6-27b-autoround}"
@@ -374,8 +386,18 @@ run_check "longctx" check_longctx
 echo ""
 if [[ "$FAILED" == "0" ]]; then
   printf "\033[32mAll checks passed.\033[0m Stack is ready for full-functionality use.\n"
-  exit 0
 else
   printf "\033[31m%d check(s) failed.\033[0m See hints above.\n" "$FAILED"
-  exit 1
 fi
+
+if [[ "$RUN_BENCH" == "1" && "$FAILED" == "0" ]]; then
+  echo ""
+  echo "=========================================="
+  echo "  --bench: running scripts/bench.sh"
+  echo "=========================================="
+  SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  URL="${URL}" MODEL="${MODEL}" CONTAINER="${CONTAINER}" \
+    bash "${SCRIPT_DIR}/bench.sh"
+fi
+
+exit "$FAILED"
