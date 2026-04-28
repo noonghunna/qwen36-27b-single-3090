@@ -27,3 +27,6 @@ compose/*.log
 # Local env overrides
 .env
 *.env.local
+
+# Local safety backups of compose files (e.g. docker-compose.v714.yml.default)
+compose/*.default
