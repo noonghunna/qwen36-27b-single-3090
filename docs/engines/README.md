@@ -8,11 +8,11 @@ This repo's main path is **vLLM** because it has the deepest support for Qwen3-N
 
 ## At a glance
 
-| Engine | Status on this stack | Per-stream TPS (1× 3090) | Vision | Tool calls | Spec-decode | OpenAI API parity |
-|---|---|---|---|---|---|---|
-| **[vLLM](VLLM.md)** ⭐ | **Validated, production-grade** (this repo) | 51-55 narr / 67-70 code | ✅ | ✅ | ✅ MTP n=3 | ✅ Full |
-| **[llama.cpp](LLAMA_CPP.md)** | Works via [Luce DFlash fork](https://github.com/luce-spec/llama-cpp-dflash) at server level; mainline llama.cpp Qwen3-Next support still landing | 28-60 (varies by quant + DDTree) | ✅ (via mmproj) | ⚠️ Limited (no auto-tool-choice in server) | ✅ DFlash N=5 in fork | ⚠️ Partial |
-| **[SGLang](SGLANG.md)** | **Blocked** by same Marlin pad-sub-tile-n bug (vllm#40361 / sglang equivalent); EAGLE spec-decode separately blocked by GDN/DeltaNet rollback | n/a (untested at this state) | ✅ | ✅ | ⚠️ EAGLE blocked on hybrid | ✅ Full |
+| Engine | Status on this stack | Per-stream TPS (1× 3090) | Max ctx (1× 3090) | Vision | Tool calls | Spec-decode | OpenAI API parity |
+|---|---|---|---|---|---|---|---|
+| **[vLLM](VLLM.md)** ⭐ | **Validated, production-grade** (this repo) | 51-55 narr / 67-70 code | 48K safe (192K-205K opt-in with caveats) | ✅ | ✅ | ✅ MTP n=3 | ✅ Full |
+| **[llama.cpp](LLAMA_CPP.md)** | Works mainline + [Luce DFlash fork](https://github.com/luce-spec/llama-cpp-dflash) for spec-decode | 35-60 (varies by quant + KV type) | **262K** (Q4_K_M + q4_0 KV) | ✅ (via mmproj) | ⚠️ Limited (no auto-tool-choice in server) | ✅ DFlash N=5 in fork | ⚠️ Partial |
+| **[SGLang](SGLANG.md)** | **Blocked** by same Marlin pad-sub-tile-n bug (vllm#40361 / sglang equivalent); EAGLE spec-decode separately blocked by GDN/DeltaNet rollback | n/a (untested at this state) | n/a | ✅ | ✅ | ⚠️ EAGLE blocked on hybrid | ✅ Full |
 
 ---
 
@@ -82,20 +82,47 @@ This repo's main path is **vLLM** because it has the deepest support for Qwen3-N
 
 ## How to choose
 
-```
-Need full Qwen3.6 features (vision, tools, MTP, OpenAI API) on a single 3090?
-  → vLLM (this repo's main path)
+| Your priority | Pick | Why |
+|---|---|---|
+| **Full feature set, MTP spec-decode, OpenAI API parity** | vLLM + Lorbus AutoRound | This repo's path. 51-70 TPS depending on workload, all features, prefill-safe at 48K default. |
+| **Maximum context (262K) on one 3090** | llama.cpp + UD-Q3_K_XL or Q4_K_M + q4_0 KV | Smaller quants leave 8-10 GB headroom for KV at 262K. ~35-45 TPS sustained. |
+| **Best concurrent throughput on dual 3090** | vLLM TP=2 + Turbo (TQ3) | 4 streams at full 262K, ~200 TPS aggregate. See [companion repo](https://github.com/noonghunna/qwen36-dual-3090). |
+| **Non-NVIDIA hardware (AMD / Intel / Apple)** | llama.cpp | Only engine with cross-platform support. |
+| **Lightest setup, fastest cold start** | llama.cpp | Single binary, ~30s cold start. Good for embedded use, quick experiments. |
+| **High-throughput multi-tenant serving** | SGLang (when unblocked — currently blocked on Qwen3.6) | RadixAttention prefix sharing wins at scale. Watch list in SGLANG.md. |
 
-Want to try llama.cpp / Ollama / LM Studio?
-  → llama.cpp page — quick GGUF recipe + Luce DFlash fork pointer
+---
 
-Looking for SGLang?
-  → SGLang page — current blocked status + watch list
+## Quant choice (orthogonal to engine choice)
 
-Already comfortable with one engine and want to know if you're missing
-something on the others?
-  → Read all three pages for a 10-minute overview
-```
+The model itself comes in several quant formats. Engine-quant compatibility:
+
+| Quant | Disk size | Engine fit | Notes |
+|---|---|---|---|
+| **AutoRound int4** ([Lorbus](https://huggingface.co/Lorbus/Qwen3.6-27B-int4-AutoRound)) | ~18-19 GB | vLLM ✅ · llama.cpp ❌ · SGLang (when unblocked) | This repo's choice. W4A16, group_size=128, BF16 mtp.fc head. **Required** for vLLM's MTP spec-decode. |
+| GPTQ int4 | ~16.5-17 GB | vLLM ✅ · llama.cpp ❌ · SGLang ✅ | Mature, broadly supported. Slightly smaller disk than AutoRound. |
+| AWQ int4 | ~16-17 GB | vLLM ✅ · llama.cpp ❌ · SGLang ✅ | Strong baseline, compatible with Marlin kernels. |
+| GGUF Q4_K_M | ~16.8 GB | llama.cpp ✅ · vLLM ⚠️ experimental · SGLang ❌ | The default GGUF mid-range quant. Strong quality, broad ecosystem (Ollama, LM Studio, etc). |
+| GGUF UD-Q3_K_XL ([Unsloth](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF)) | **~14.5 GB** | llama.cpp ✅ | Smaller than 4-bit options. Quality cost is small on Qwen3.6 (quantization-friendly), buys substantial KV cache room. |
+| GGUF Q3_K_M | ~13.6 GB | llama.cpp ✅ | More aggressive 3-bit; quality cost real but acceptable for many workloads. |
+
+### AutoRound vs GPTQ vs AWQ (within vLLM)
+
+All three are 4-bit weight-only quantization for vLLM. Differences:
+
+| Aspect | AutoRound | GPTQ | AWQ |
+|---|---|---|---|
+| **Method** | Signed gradient descent jointly optimizing rounding + scaling | Layer-wise Hessian-based error minimization | Activation-aware salience scaling, then RTN |
+| **Calibration set** | Small (~128-512 samples) | Larger (~1024-2048) | Small-medium |
+| **Quantization time** | Minutes to ~1-2 hours for 27B | Slower for same model | Fast |
+| **Accuracy at 4-bit** | Typically slightly best on hard reasoning (MMLU/GPQA/Math style) | Strong baseline; 0.5-2% behind AutoRound on average | Comparable to GPTQ; depends on tuning |
+| **Ultra-low bits (3, 2)** | Strongest at <4 bit | Degrades faster below 4 bit | Middle of the pack |
+| **Marlin kernel support** | ✅ (via the kernel-line fix in our [vllm#40361](https://github.com/vllm-project/vllm/pull/40361)) | ✅ (mature) | ✅ |
+| **Ecosystem** | Newer, growing fast (Intel-maintained) | Most mature, broadest tool support | Strong vLLM/SGLang support |
+
+**Why we picked AutoRound for this repo:** Lorbus's AutoRound quant ships `mtp.fc.weight` as BF16 (preserved at higher precision), which lets vLLM's `Qwen3_5MTP` loader actually load the head and run multi-token prediction at high acceptance rates (~80% per-position-1, AL ~3.5). GPTQ-quantized variants of the MTP head silently fail to load → 0% draft acceptance. So AutoRound isn't just "slightly better quality" here — it's the only path to working MTP spec-decode in vLLM today.
+
+If MTP isn't a priority for your workload, GPTQ or AWQ are equally valid.
 
 ---
 

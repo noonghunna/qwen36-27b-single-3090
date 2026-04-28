@@ -131,5 +131,6 @@ You don't need to switch unless:
 - You need lighter cold start / smaller footprint → [llama.cpp](LLAMA_CPP.md)
 - You need to run on AMD / Intel / Apple Silicon → [llama.cpp](LLAMA_CPP.md)
 - You're building a high-throughput multi-tenant service and want SGLang's RadixAttention scheduling → [SGLang](SGLANG.md) (currently blocked, see watch list)
+- **You want max context (262K) on a single 3090** → [llama.cpp + Q4_K_M + q4_0 KV](LLAMA_CPP.md#going-to-262k-full-qwen36-context-on-a-single-3090). Honest trade-off: AutoRound (~19 GB) leaves only ~3-4 GB for KV at full ctx; a smaller GGUF leaves ~8-10 GB. You lose MTP spec-decode (~30% TPS) but gain ~5× the usable context.
 
 For most local-LLM use cases, vLLM is the right pick on this model class. Other engines exist for legitimate reasons; this stack is just optimized for the vLLM path.
