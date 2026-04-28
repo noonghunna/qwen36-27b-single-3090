@@ -66,6 +66,10 @@ Five configurations + five opt-in tiers on the default, all measured end-to-end 
 
 ### Activation-memory caveat (read this before raising `--max-model-len`)
 
+<p align="center">
+  <img src="docs/img/vram-budget.svg" alt="VRAM budget on a single 24 GB RTX 3090 — model weights are fixed at 17.7 GB, and --gpu-memory-utilization shifts the split between KV pool and activation headroom. Default 48K + 0.92 leaves 1.9 GB headroom — fits both prefill cliffs. Pushing to 192K + 0.98 leaves only 0.5 GB — Cliff 2 OOMs." width="100%"/>
+</p>
+
 Two prefill-activation cliffs make 24 GB-card defaults non-trivial. vLLM's `--gpu-memory-utilization` is a **hard cap, not a soft limit** — there's no fallback or circular buffer. Whatever's outside the cap (activation peaks, fragmentation, kernel scratch) has to fit in `(1 - mem_util) × 24 GB`. The engine's pre-check guarantees the steady-state KV fits — **not the activation peak during forward**.
 
 **Cliff 1 — TurboQuant attention scratch + tool-response prefill** (the bug ampersandru reported in [#1](https://github.com/noonghunna/qwen36-27b-single-3090/issues/1)). Triggered when a ≥25K-token tool message is loaded into the conversation at high mem_util. OOM site: TurboQuant attention forward, dequant scratch + mid_o/output buffers. Allocation typically ~138 MiB.
@@ -101,6 +105,37 @@ In practice: **set max-model-len to your cliff (48K) for safety; let the agent f
 - **Skip Genesis but keep MTP TPS** — **No-Genesis MTP** (`docker-compose.no-genesis-mtp.yml`). Same 55/68 as Fast-chat.
 
 > 📚 **Per-use-case deep dives** (gotchas, limitations, tuning levers, examples) → [docs/USE_CASES.md](docs/USE_CASES.md)
+
+### When a single GPU isn't enough — moving to 2× 3090
+
+A single 24 GB 3090 has hard ceilings that no amount of config tuning can clear. If you're hitting any of these, a second card is the only fix:
+
+| Limit on 1× 3090 | Why it's stuck | What 2× 3090 unlocks |
+|---|---|---|
+| Single prompt > ~50K tokens crashes (Cliff 2) | DeltaNet GDN state grows linearly with seq_len; single-card activation budget runs out around 50-60K. | TP=2 splits GDN state across cards. We tested up to 90K-token prompt depth on the dual stack — passes recall ladder. |
+| Per-stream TPS hard-capped at ~70 code / ~55 narr | Decode is memory-bandwidth-bound on 3090 (~936 GB/s). Single card can't go faster regardless of config. | Per-stream stays ~similar (~89 code / ~71 narr — small gain) due to PCIe-only allreduce overhead. |
+| Effectively single-user — concurrent requests serialize | KV pool is already sized to fit one user's full context; 2 concurrent users mean each gets half the ctx or one waits. | 4 concurrent streams at full 262K ctx (turbo variant) — **aggregate ~257 TPS, ~5× the single-card cap** for serving. |
+| Max usable context ~48K (default) or ~96K with caveats | Cliffs + activation budget. | **262K context** — full Qwen3.6 model max. fp8 KV (default) avoids the GDN cliff entirely. |
+| No image generation, no concurrent vision + RAG, no multi-agent | All single-tenant. | Multi-tenant: serve a chat agent + a coding agent + a RAG endpoint concurrently. |
+
+**When to invest in a second card:**
+
+- ✅ You serve **multiple users / agents concurrently** (team setup, shared chat backend, multi-agent system)
+- ✅ You routinely send **single prompts > 50K tokens** (whole-codebase agents, long-doc analysis, large RAG retrievals)
+- ✅ You want **full 262K context with vision** (the dual stack runs this at fp8 KV + 71 narr / 89 code TPS single-stream)
+- ✅ You're hitting Cliff 2 (the GDN OOM) regularly and don't want to scope your prompts around it
+
+**When NOT to bother:**
+
+- ❌ You're a single user doing chat or single-file coding — single-card 48K is plenty, and per-stream TPS is virtually identical
+- ❌ You want maximum chat TPS at small context (the single-card `fast-chat.yml` at 55/70 TPS edges out dual-card per-stream slightly)
+- ❌ You can't justify ~$700-1500 for a second card + slot/PSU upgrades
+
+**Cost note:** PCIe-only (no NVLink bridge). The dual stack ships with NCCL_P2P_DISABLE=1 because NVLink isn't expected. Combined power draw at 230W cap each is ~460W — most ATX PSUs handle this comfortably.
+
+> 📦 **Companion repo:** [github.com/noonghunna/qwen36-dual-3090](https://github.com/noonghunna/qwen36-dual-3090) — the same model, the same patches, plus Marlin pad-sub-tile-n (vllm#40361) and Genesis Turbo variant for 4-stream concurrency.
+
+---
 
 ### What's not working today
 
