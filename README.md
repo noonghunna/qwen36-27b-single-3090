@@ -17,6 +17,7 @@
 **Got it running, want to compare configs?** → [Status at a glance](#status-at-a-glance).
 **Hit an error?** → [Troubleshooting](#troubleshooting).
 **Don't know what TPS / KV / MTP mean?** → [Glossary](#glossary) at the bottom.
+**Want llama.cpp or SGLang instead of vLLM?** → [docs/engines/](docs/engines/) (comparison + recipes).
 
 ---
 
@@ -105,6 +106,7 @@ In practice: **set max-model-len to your cliff (48K) for safety; let the agent f
 - **Skip Genesis but keep MTP TPS** — **No-Genesis MTP** (`docker-compose.no-genesis-mtp.yml`). Same 55/68 as Fast-chat.
 
 > 📚 **Per-use-case deep dives** (gotchas, limitations, tuning levers, examples) → [docs/USE_CASES.md](docs/USE_CASES.md)
+> 🔬 **Trying a different inference engine?** Comparison of vLLM / llama.cpp / SGLang for this model class → [docs/engines/](docs/engines/)
 
 ### When a single GPU isn't enough — moving to 2× 3090
 
@@ -472,7 +474,9 @@ qwen36-27b-single-3090/
 ├── LICENSE                                     Apache-2.0
 ├── docs/
 │   ├── INTERNALS.md                            deep technical: why this works, 9-probe bug isolation, upstream tracking
-│   └── USE_CASES.md                            per-workload guides: chat, coding, agents, RAG, vision, frontier
+│   ├── USE_CASES.md                            per-workload guides: chat, coding, agents, RAG, vision, frontier
+│   ├── engines/                                comparison + recipes for vLLM (this repo) / llama.cpp / SGLang
+│   └── img/                                    illustrations (vram-budget.svg, ...)
 ├── patches/
 │   ├── patch_tolist_cudagraph.py               our CUDA graph capture crash fix (#40807)
 │   ├── patch_pr40798_workspace.py              research artifact — backports vllm#40798 (kept for negative-result reproducibility)
