@@ -1,5 +1,17 @@
 # Qwen3.6-27B on a single RTX 3090
 
+> ## 🚚 Active development moved to **[noonghunna/club-3090](https://github.com/noonghunna/club-3090)**
+>
+> The single-card and dual-card recipes have been consolidated into a single model-agnostic repo organized by inference engine (vLLM / llama.cpp / SGLang) rather than by card count.
+>
+> - **For new setups:** use [club-3090](https://github.com/noonghunna/club-3090) — the current configs live at `models/qwen3.6-27b/vllm/compose/` (single + dual variants).
+> - **Existing setups keep working:** this repo isn't deleted; its files are unchanged. But future bug fixes, improvements, and new model support land in club-3090.
+> - **New issues:** please file at [club-3090/issues](https://github.com/noonghunna/club-3090/issues). This repo's issue tracker remains open for ongoing conversations (e.g. [#1](https://github.com/noonghunna/qwen36-27b-single-3090/issues/1)) but new threads should go to the new repo.
+>
+> The original README content is preserved below for users following links from Medium articles, Reddit posts, and similar.
+
+---
+
 **Run the Qwen3.6-27B language model — with vision and tool calling — on one consumer GPU.** No cloud, no API bills. Drop-in replacement for ChatGPT/Claude in any tool that uses the OpenAI SDK.
 
 ---
