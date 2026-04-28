@@ -12,26 +12,57 @@ Based on [`Lorbus/Qwen3.6-27B-int4-AutoRound`](https://huggingface.co/Lorbus/Qwe
 
 ## Status at a glance
 
-Six configurations, all measured end-to-end on a single 3090 PCIe / 230W cap with bench prompts (1000-token narrative essay + 800-token quicksort code), `vllm/vllm-openai:nightly-07351e0883470724dd5a7e9730ed10e01fc99d08` (vLLM `dev205+g07351e088`, Sandermage's reference target) + Genesis v7.54. Pick by workload.
+Six configurations + five v7.14 opt-in tiers, all measured end-to-end on a single 3090 PCIe / 230W cap with bench prompts (1000-token narrative essay + 800-token quicksort code), `vllm/vllm-openai:nightly-07351e0883470724dd5a7e9730ed10e01fc99d08` (vLLM `dev205+g07351e088`, Sandermage's reference target) + Genesis v7.54. **`v714` ships 48K + 0.92 by default** — passes all 10 verify-full.sh checks including tool-response prefill (#8) and long-context needle (#7). Pick by workload; if you push past 48K read the **Activation-memory caveat** below first.
 
 | Variant | Context | Narr TPS | Code TPS | Vision | Tools | Patches | VRAM | Notes |
 |---|---|---|---|---|---|---|---|---|
-| **v7.14** (`docker-compose.v714.yml`) — TQ + Genesis P65, 192K ⭐⭐ | **192K** | **50.9** | **67.7** | ✅ | ✅ | Genesis v7.14+ | 22.3 GB | **Recommended for everything ≥20K.** P65 cudagraph PIECEWISE downgrade for spec-decode. TPS holds across 32K → 65K → 90K → 125K → 192K. |
-| **v7.14 — max-ctx no-vision** (uncomment `--language-model-only` in v714.yml) | **205K** | 50.1 | 65.8 | ❌ | ✅ | Genesis v7.14+ | 21.5 GB | **Absolute single-card ceiling on TQ3 KV.** Engine reports 206,400 max at 0.98. Drop vision frees ~1 GB → KV budget grows from 3.31 → 3.42 GiB → 200K-205K fits. Same TPS as 192K-with-vision within run-to-run variance. |
+| **v7.14** (`docker-compose.v714.yml`) — TQ + Genesis P65, **48K + 0.92** ⭐⭐ | **48K** | **50.9** | **67.5** | ✅ | ✅ | Genesis v7.14+ | 21.0 GB | **Production-safe default.** Below BOTH cliffs: GDN-forward (~50-60K single-prompt OOM) and TurboQuant tool prefill (~25K at high mem_util). All 10 verify-full.sh checks PASS. Vision + tools + MTP work. |
+| **v7.14 — opt-in 64K** (edit v714.yml: `max-model-len=64000`) | **64K** | 50.9 | 67.5 | ✅ | ✅ | Genesis v7.14+ | 21.5 GB | More chat-history room. Single prompts >~50K may OOM in GDN forward. Tool prefills ≤40K safe. |
+| **v7.14 — opt-in 96K + 0.93** | **96K** | 50.9 | 67.5 | ✅ | ✅ | Genesis v7.14+ | 22.0 GB | Useful for "long history, small individual prompts." Single prompts >~50K OOM. Tool prefills ≤30K. |
+| **v7.14 — opt-in 128K + 0.95** | **128K** | 50.9 | 67.5 | ✅ | ✅ | Genesis v7.14+ | 22.3 GB | Matches GPT-4 Turbo / DeepSeek-R1 ctx tier on paper. Single prompts >~50K OOM. Tool prefills ≤40K. |
+| **v7.14 — opt-in 192K + 0.98** | **192K** | 50.9 | 67.7 | ✅ | ✅ | Genesis v7.14+ | 22.3 GB | OOMs on ≥25K tool prefills ([#1](https://github.com/noonghunna/qwen36-27b-single-3090/issues/1) ampersandru's repro). Pick only if no big tool/doc prefills. |
+| **v7.14 — opt-in 205K text-only** (also uncomment `--language-model-only`) | **205K** | 50.1 | 65.8 | ❌ | ✅ | Genesis v7.14+ | 21.5 GB | Absolute single-card ceiling on TQ3 KV (engine reports 206,400 max at 0.98). Drops vision to free ~1 GB. Same prefill-OOM caveat as 192K. |
 | **Default** (`docker-compose.yml`) — fp8 KV + MTP n=3 ⭐ | 20K | **55.0** | **70.5** | ✅ | ✅ | Genesis | 22.3 GB | Best TPS at small ctx. fp8 KV sidesteps the cudagraph bug entirely. Pick when you only need ≤20K and want maximum TPS. |
 | **Tools-text** (`docker-compose.tools-text.yml`) — fp8 + 75K | 75K | 53.4 | 69.6 | ❌ | ✅ | Genesis | 22.2 GB | Drops vision to free KV pool. fp8 KV — cudagraph bug doesn't fire. Faster than v7.14 at ≤75K. |
 | **No-Genesis MTP** (`docker-compose.no-genesis-mtp.yml`) — fp8 + MTP, no patches | 20K | 54.7 | 68.2 | ✅ | ✅ | **none** | 22.3 GB | Identical to Default minus Genesis. Same TPS — Genesis is performance-neutral on the fp8+MTP path. Pick if you want to skip the patch tree. (Cross-rig peer: [u/sudeposutemizligi's TP=2 setup](#cross-rig-validation).) |
 | **Minimal** (`docker-compose.minimal.yml`) — no spec-decode, fp8 KV | 32K | 32.4 | 32.6 | ✅ | ✅ | **none** | 20.8 GB | Simplest stack. No spec-decode → no #40880 trigger. Pure-bandwidth ceiling. |
-| ~~**Long-ctx**~~ (`docker-compose.longctx-experimental.yml`) — DEPRECATED | ~~125K~~ | ~~37.9~~ | ~~49.8~~ | ✅ | ✅ | Genesis | 23.1 GB | **Superseded by v7.14 @ 192K.** Same context ceiling, lower TPS via `cudagraph_mode=NONE`. Kept for reference; not recommended for new deployments. |
+| ~~**Long-ctx**~~ (`docker-compose.longctx-experimental.yml`) — DEPRECATED | ~~125K~~ | ~~37.9~~ | ~~49.8~~ | ✅ | ✅ | Genesis | 23.1 GB | **Superseded by v7.14.** Same effective working ceiling, lower TPS via `cudagraph_mode=NONE`. Kept for reference. |
 
-### Decision tree
+### Activation-memory caveat (read this before raising `--max-model-len`)
 
-- **Want simplest possible stack, no patches, no fuss?** → **Minimal**. 32 TPS, every feature works, zero risk.
-- **Want max TPS for chat / code / general use ≤20K, OK with Genesis tree?** → **Default**. 55 narrative / 70 code TPS.
-- **Want max TPS at 20K, prefer no patches?** → **No-Genesis MTP**. Same 55/68 — Genesis is perf-neutral on this path.
-- **Need 75K ctx + tools but no vision?** → **Tools-text** (53/70 TPS).
-- **Need anything 20K → 192K with vision?** → **v7.14**. 51 narr / 68 code TPS sustained across the entire range.
-- **Need maximum context (200K+) and don't need vision?** → **v7.14 with `--language-model-only` uncommented**. 50/66 TPS at 205K. Engine ceiling on this hardware.
+Two prefill-activation cliffs make 24 GB-card defaults non-trivial. vLLM's `--gpu-memory-utilization` is a **hard cap, not a soft limit** — there's no fallback or circular buffer. Whatever's outside the cap (activation peaks, fragmentation, kernel scratch) has to fit in `(1 - mem_util) × 24 GB`. The engine's pre-check guarantees the steady-state KV fits — **not the activation peak during forward**.
+
+**Cliff 1 — TurboQuant attention scratch + tool-response prefill** (the bug ampersandru reported in [#1](https://github.com/noonghunna/qwen36-27b-single-3090/issues/1)). Triggered when a ≥25K-token tool message is loaded into the conversation at high mem_util. OOM site: TurboQuant attention forward, dequant scratch + mid_o/output buffers. Allocation typically ~138 MiB.
+
+**Cliff 2 — DeltaNet/GLA recurrent state buffer.** Triggered by any single prompt above ~50-60K tokens (regardless of tool use). OOM site: `fla.ops.chunk.chunk_gated_delta_rule_fwd_h.h.new_empty(B, NT, H, V, K)` where NT grows linearly with prompt length. Qwen3-Next is hybrid (every 4th layer is full attention; the other 3 are GDN). GDN state is sized by total seq_len — chunked-prefill doesn't help. We can't fix this without multi-GPU TP=2 or upstream `fla.ops` changes.
+
+| Config | Engine ceiling | Safe single-prompt | Safe tool-prefill | Best for |
+|---|---|---|---|---|
+| **48K + 0.92** ⭐ | ~86K | up to 48K | up to 48K | **Default.** All verify-full.sh checks pass. Production-safe; engine rejects > 48K with HTTP 400. |
+| 64K + 0.92 | ~86K | up to ~50K | up to 40K | Common chat + agent flows. Single prompts >50K may OOM. |
+| 96K + 0.93 | ~103K | up to ~50K | up to 30K | Long history, small individual prompts. |
+| 128K + 0.95 | ~140K | up to ~50K | up to 40K | Matches GPT-4-tier on paper. Same single-prompt cliff. |
+| 192K + 0.98 | ~206K | up to ~16K | up to 16K | Long-ctx recall only. OOMs on big tool prefills (ampersandru-class workload). |
+| 205K + 0.98 + no vision | ~206K | up to ~16K | up to 16K | Engine ceiling. Same caveats. |
+
+#### Defense-in-depth — three places to enforce safety
+
+1. **`--max-model-len` (vLLM, hardest)** — engine rejects requests where `input_tokens + max_tokens > limit` with **HTTP 400** before any forward pass. **This is the only true safety net** — the cleanest UX is to set max-model-len **at or below the cliff** so oversized requests fail fast with a clean error, not an OOM crash. (Why 48K is the default: just below Cliff 2's GDN onset.)
+
+2. **Agent-framework truncation (middle layer)** — Hermes, OpenAI Assistants, Roo Cline, LangChain, Open WebUI, Cursor and similar agent frameworks **truncate tool responses** before feeding them back into the next turn. Most default to a 10-20K-token cap on individual tool outputs. This is your second line of defense — it shapes what the agent loads back, regardless of vLLM's setting. Check your framework's docs (e.g. OpenAI's `truncation_strategy`, LangChain's `length_function` callbacks) to confirm and tune.
+
+3. **System prompts (least reliable)** — telling the model "don't fetch >X tokens" or "summarize tool returns >5K" has weak compliance — the model passes the call to the tool, the tool returns what it returns, and the system-prompt rule doesn't gate the agent's loop. Useful as a hint, not a guarantee.
+
+In practice: **set max-model-len to your cliff (48K) for safety; let the agent framework do realistic truncation for tool responses; don't rely on system prompts as the safety mechanism.** If a user genuinely needs longer context (some research/document workflows), have them switch to a matching opt-in config and accept the trade-off explicitly.
+
+### Decision tree (matched to use case)
+
+- **General chat / Q&A / quick coding (≤20K)** — **Default** (`docker-compose.yml`). 55 narrative / 70 code TPS, ✅ vision, ✅ tools, fp8 KV. Best TPS; no Cliff 2 risk because 20K stays well below 50K.
+- **Tool-using agents + multi-turn coding (≤48K)** — **v7.14 default** (`docker-compose.v714.yml`). 51/68 TPS with vision, full tool/streaming/thinking support, prefill-safe to 48K. **Recommended for anyone running Hermes / Cline / Roo / OpenAI Assistants on this stack.**
+- **Long single prompts (single-shot 50K+ summarization or RAG)** — **Tools-text** (`docker-compose.tools-text.yml`) at 75K + fp8. fp8 KV avoids the GDN cliff at 50-60K (tested through 60K depth). Trade-off: no vision.
+- **Frontier context (192K-205K) for "fits in giant book" use cases** — opt into v7.14 192K or 205K. Read the caveats first.
+- **Simplest stack, no patches** — **Minimal** (`docker-compose.minimal.yml`). 32 TPS, no spec-decode, no Genesis. Zero risk.
+- **Skip Genesis but keep MTP TPS** — **No-Genesis MTP** (`docker-compose.no-genesis-mtp.yml`). Same 55/68 as Default.
 
 ### Removed: eager.yml
 
@@ -120,14 +151,16 @@ cd compose && docker compose up -d
 # Text-only — 75K, no vision, fp8 KV, MTP n=3, Genesis  →  53 narr / 70 code TPS
 cd compose && docker compose -f docker-compose.tools-text.yml up -d
 
-# v7.14 — 192K, vision, TQ3 KV, MTP n=3, Genesis P65  →  51 narr / 68 code TPS (RECOMMENDED for ≥20K with vision)
+# v7.14 — 48K, vision, TQ3 KV, MTP n=3, Genesis P65  →  51 narr / 68 code TPS
+#         RECOMMENDED default for tool-using agents. Below GDN forward cliff;
+#         all 10 verify-full.sh checks pass. Engine rejects > 48K cleanly.
 cd compose && docker compose -f docker-compose.v714.yml up -d
 
-# v7.14 — max-ctx text-only (edit v714.yml: uncomment --language-model-only, set max-model-len=205000)
-#  →  205K, 50 narr / 66 code TPS (engine ceiling on 24 GB Ampere)
-cd compose && docker compose -f docker-compose.v714.yml up -d
+# v7.14 — opt-in 64K-205K (edit v714.yml: change max-model-len + mem-util)
+#         See header comment block in v714.yml for the full envelope matrix.
+#         All opt-ins at higher ctx have prefill-OOM caveats — read first.
 
-# Long-ctx (DEPRECATED — superseded by v7.14 @ 192K)
+# Long-ctx (DEPRECATED — superseded by v7.14)
 # cd compose && docker compose -f docker-compose.longctx-experimental.yml up -d
 
 # No-Genesis MTP — 20K, vision, fp8 KV, MTP n=3, no patches  →  55 narr / 68 code TPS
@@ -244,7 +277,23 @@ n=4 barely beats n=3 on code peak but the position-4 draft accept collapses to 2
 
 ### Context ceiling
 
-`--max-model-len 125000` is the largest value vLLM's `_check_enough_kv_cache_memory` pre-check accepts with our config. The KV pool itself (198K tokens) is larger, but the extra capacity is used for Mamba/DeltaNet recurrent state + prefix cache + spec-decode scratch blocks — **don't bypass the pre-check**, those tokens are load-bearing.
+`docker-compose.v714.yml` ships with **48K + `gpu-memory-utilization=0.92`** as the production-safe default. Below both prefill cliffs (see "Activation-memory caveat" above), all 10 verify-full.sh checks pass, oversized requests get a clean HTTP 400.
+
+For deployments that need different trade-offs, the full envelope at lower mem-util values (measured 2026-04-28 on dev205 + Genesis v7.54, vision on, TQ3 KV):
+
+| mem-util | Engine ceiling | Activation headroom | Safe single-prompt | Safe tool-prefill |
+|---|---|---|---|---|
+| **0.92** ⭐ | **~86K** | **~1.9 GB** | **up to 48K (default ships at this max)** | **up to 48K** |
+| 0.93 | ~103K | ~1.7 GB | up to ~50K | up to ~50K |
+| 0.95 | ~140K | ~1.2 GB | up to ~50K (cliff 2 fires above) | up to ~40K |
+| 0.97 | ~175K | ~720 MB | up to ~50K | up to ~16K (ampersandru-class workloads OOM here) |
+| 0.98 | ~206K | ~480 MB | up to ~50K | up to ~16K |
+
+The `mem-util` choice **does not** raise Cliff 2 (GDN single-prompt OOM around 50-60K) — that's hardware-bound on a single 24 GB card with this hybrid architecture. Lowering `mem-util` only helps Cliff 1 (TurboQuant tool prefill).
+
+To push to 192K-205K (text only, with both prefill caveats): edit `v714.yml`, set `max-model-len=192000` (or 205000 + uncomment `--language-model-only`) and `gpu-memory-utilization=0.98`. Re-read the activation-memory caveat above before doing so.
+
+Older composes (`longctx-experimental.yml`, deprecated) cap at 125K because `cudagraph_mode=NONE` keeps inductor compiled scratch + a larger eager-decode footprint. v7.14's PIECEWISE downgrade for spec-decode reclaims that headroom.
 
 ### Power cap
 
@@ -419,10 +468,10 @@ qwen36-27b-single-3090/
 ├── compose/
 │   ├── docker-compose.yml                      DEFAULT — fp8 + MTP + vision + Genesis, 20K, 55 narr / 70 code TPS
 │   ├── docker-compose.tools-text.yml           fp8 + MTP + Genesis, no vision, 75K, 53 narr / 70 code TPS
-│   ├── docker-compose.v714.yml                 ⭐ TQ3 + MTP + Genesis P65, 192K vision (or 205K via --language-model-only), 51 narr / 68 code TPS
+│   ├── docker-compose.v714.yml                 ⭐ TQ3 + MTP + Genesis P65, 48K default vision (opt-in 64K-205K), 51 narr / 68 code TPS
 │   ├── docker-compose.no-genesis-mtp.yml       fp8 + MTP, no patches, 20K, 55 narr / 68 code TPS
 │   ├── docker-compose.minimal.yml              fp8, no spec-decode, 32K, 32 narr / 33 code TPS
-│   └── docker-compose.longctx-experimental.yml DEPRECATED — superseded by v714 @ 192K
+│   └── docker-compose.longctx-experimental.yml DEPRECATED — superseded by v714 (default 48K, opt-in to higher)
 └── scripts/
     ├── setup.sh                                clone Genesis + download model + SHA verify
     ├── verify.sh                               quick smoke test (~10 sec)

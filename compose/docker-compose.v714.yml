@@ -16,23 +16,64 @@
 #   - Tool calls now WORK (was silently broken — `<tool_call>` cascade)
 #   - 51 narrative / 68 code TPS sustained across 32K → 65K → 90K → 125K → 192K
 #
-# Context ceiling on dev205 + Genesis v7.54 (verified 2026-04-27):
-#   - 192K fits at gpu-memory-utilization=0.98 (engine reports 3.31 GiB KV,
-#     22.3 GB total VRAM at peak)
-#   - 200K OOMs (KV needs 3.31 GiB, only 3.05 GiB available at 0.97)
-#   - Earlier "32K cap" comment in this header was stale — Genesis v7.54 +
-#     dev205 nightly has tighter activation footprint than older substrate
+# Two prefill-activation cliffs make 24 GB-card defaults non-trivial (verified 2026-04-28):
 #
-# This variant is now the recommended path for ALL contexts up to 192K. It
+# CLIFF 1 — TurboQuant attention scratch + tool-response prefill
+#   Trigger: ≥25K total prompt with TQ3 KV at high mem_util.
+#   Site:    turboquant_attn forward, dequant scratch + mid_o/output buffers.
+#   Symptom: CUDA OOM allocating ~138 MiB; engine dies mid-request.
+#   Why:    fits the bug ampersandru reported in #1 (Hermes news-fetch, 20K+
+#           token tool response stuffed back into the conversation).
+#
+# CLIFF 2 — DeltaNet/GLA recurrent state buffer
+#   Trigger: single prompt above ~50-60K tokens (regardless of tool use).
+#   Site:    fla.ops.chunk.chunk_gated_delta_rule_fwd_h.h.new_empty(B, NT, H, V, K)
+#           where NT = ceil(seq_len / chunk_size) — grows with prompt length.
+#   Symptom: CUDA OOM allocating ~50-740 MiB during forward; engine dies.
+#   Why:    Qwen3-Next is hybrid (16 attention + 48 GDN layers). GDN state
+#           is sized by total seq_len, not chunk size — chunked-prefill
+#           doesn't help. We can't fix this short of multi-GPU or upstream
+#           kernel changes.
+#
+# vLLM's `--gpu-memory-utilization` is a hard cap with no soft fallback or
+# circular eviction. Everything outside the cap — prefill activation peaks,
+# fragmentation, kernel scratch — has to fit in `(1 - mem_util) × 24 GB`.
+# vLLM's pre-check guarantees the steady-state KV fits, not the activation
+# peak during forward.
+#
+# Measured envelope on dev205 + Genesis v7.54 (1× 3090 24 GB, vision on, TQ3 KV):
+#
+#   max-model-len   mem-util    boots?   safe single-prompt    notes
+#   ────────────────────────────────────────────────────────────────────────────
+#    48,000          0.92       ✅       up to 48K               ⭐ default — verify-full.sh ALL 10 PASS
+#    64,000          0.92       ✅       up to ~50K               needle scale=900 (~58K) OOMs
+#    96,000          0.93       ✅       up to ~50K               needle scale=900 OOMs
+#   128,000          0.95       ✅       up to ~40K (tool only)   #7 needle 60K+ OOMs, #8 ≤40K passes
+#   192,000          0.98       ✅       up to ~16K               #8 OOMs on 25K+ tool prefill (ampersandru)
+#   205,000          0.98 + no vision    up to ~16K               same as 192K + drops vision
+#
+# This variant ships **48K + 0.92** as the production default — verify-full.sh
+# passes all 10 checks (including the long-context needle at 10K + 30K depths,
+# tool-prefill OOM at 25K+, and MTP acceptance ≥2.0). 48K covers chat history
+# accumulation, single-file coding, tool-using agent flows up to ~30K tool
+# responses, and document analysis up to ~40K input.
+#
+# Above-cliff requests get a CLEAN HTTP 400 from the engine pre-check (not an
+# OOM crash). To push higher and accept the risk, see the opt-in matrix above
+# and the README "Activation memory caveat" section.
+#
+# This variant is the recommended path for ALL contexts up to 192K. It
 # obsoletes the older `docker-compose.longctx-experimental.yml` (38/50 TPS at
 # 125K via cudagraph_mode=NONE) which is now strictly slower at lower ctx.
 #
-# Variant matrix:
+# Variant matrix (re-bench 2026-04-27 on dev205 + Genesis v7.54):
 #
-#   docker-compose.yml             (default)   20K   66/84 TPS  vision    ✓
-#   docker-compose.tools-text.yml              75K   65/84 TPS  no vis    ✓
-#   docker-compose.longctx-experimental.yml   125K     33 TPS   vision    ✓ (cudagraph_mode=NONE workaround)
-#   docker-compose.v714.yml                    32K  55-72 TPS   vision    ✓ (THIS — Genesis v7.14 P65 surgical fix)
+#   docker-compose.yml             (default)        20K   55/70 TPS  vision    ✓
+#   docker-compose.tools-text.yml                   75K   53/70 TPS  no vis    ✓
+#   docker-compose.no-genesis-mtp.yml               20K   55/68 TPS  vision    ✓ (control — no patches)
+#   docker-compose.minimal.yml                      32K   32/33 TPS  vision    ✓ (no spec-decode)
+#   docker-compose.longctx-experimental.yml        125K   38/50 TPS  vision    ✓ (DEPRECATED — superseded by v714)
+#   docker-compose.v714.yml                        48K   51/68 TPS  vision    ✓ (THIS — Genesis v7.14 P65 + TQ3 KV; opt-in 64K-205K with caveats)
 #
 # Upstream tracker: vllm-project/vllm#40880 (Sandermage's root-cause + v7.14
 # patches). Proper kernel fix (P67) designed-but-not-implemented; v7.14 is
@@ -112,16 +153,23 @@ services:
       - float16
       - --tensor-parallel-size
       - "1"
-      # 32K — this is the practical ceiling on consumer 24 GB Ampere with
-      # v7.14's eager spec-verify. The old longctx-experimental compose hit
-      # 192K is the empirical ceiling at TQ3 + 0.98 mem-util on a 24 GB 3090
-      # with dev205 vLLM + Genesis v7.54. Engine reports max ~177504 at 0.97;
-      # bumping to 0.98 frees enough KV for 192000 to clear the pre-check.
-      # 200K OOMs at boot (3.31 GiB KV needed, only 3.05 GiB available at 0.97).
+      # 48K + 0.92 — production default. Below BOTH cliffs:
+      #   - GDN forward (single-prompt OOM at ~50-60K tokens) → 48K stays safely under
+      #   - TurboQuant tool prefill (OOM at high mem_util + big tool responses) → 0.92 leaves ~1.9 GB headroom
+      # Engine REJECTS oversized requests with HTTP 400 (clean), no crashes.
+      # Verify-full.sh ALL 10 checks pass at this combo (2026-04-28).
+      #
+      # To push higher (with caveats — read the comment block at the top of
+      # this file + the README Activation memory caveat first):
+      #   - 64K + 0.92  → up to ~50K single prompts safe (most agent flows)
+      #   - 96K + 0.93  → up to ~40-50K; #7 needle scale=900 OOMs in GDN
+      #   - 128K + 0.95 → up to ~40K tool prefill, single prompts >50K may OOM
+      #   - 192K + 0.98 → up to ~16K prefills only — ampersandru-class workload
+      #   - 205K + 0.98 + --language-model-only (uncomment below) → text-only frontier
       - --max-model-len
-      - "192000"
+      - "48000"
       - --gpu-memory-utilization
-      - "0.98"
+      - "0.92"
       - --max-num-seqs
       - "1"
       - --max-num-batched-tokens
