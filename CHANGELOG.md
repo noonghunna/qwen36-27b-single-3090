@@ -2,6 +2,27 @@
 
 Notable changes to this recipe over time. README has the current state; this file is the dated history.
 
+## 2026-04-28 — Compose rename: v7.14 is now the zero-arg default
+
+**Breaking change** (small audience; mitigation below):
+
+- `docker-compose.v714.yml` → **`docker-compose.yml`**. Running `docker compose up -d` (with no `-f` flag) now boots the production-safe TQ3 + Genesis v7.14 + MTP n=3 + 48K + 0.92 config.
+- The previous zero-arg default (fp8 + MTP n=3 + 20K) → **`docker-compose.fast-chat.yml`**. Pick this one when you only need ≤20K context and want the maximum-TPS chat path (~5-7% faster than the new default).
+- `docker-compose.longctx-experimental.yml` → **deleted**. Superseded by the default's opt-in 128K + 0.95 tier; same effective context with 35% higher TPS. Anyone using it should switch to either the default (48K), the default's 128K opt-in, or `tools-text.yml` (75K + fp8) depending on whether they need vision.
+
+**Migration (if you had scripts pointing at v714.yml):**
+```bash
+# Old
+cd compose && docker compose -f docker-compose.v714.yml up -d
+
+# New (equivalent)
+cd compose && docker compose up -d
+```
+
+Scripts pointing at `docker-compose.yml` (the old fp8 default) now boot the new TQ3-default — usually fine (more features, slightly lower TPS). If you specifically want the old chat-only path back, switch to `-f docker-compose.fast-chat.yml`.
+
+Same commit: README restructured for newcomers (new TL;DR, hardware check, glossary), deep technical content split into `docs/INTERNALS.md` and `CHANGELOG.md`, per-use-case guidance in `docs/USE_CASES.md`.
+
 ## 2026-04-28 — Prefill-OOM tests + safe v714 default
 
 Triggered by ampersandru's production OOM report ([#1](https://github.com/noonghunna/qwen36-27b-single-3090/issues/1)) — a Hermes-class agent fetching ~25K tokens of news as a tool reply at 192K context crashed the engine.

@@ -49,21 +49,20 @@ We use [`Lorbus/Qwen3.6-27B-int4-AutoRound`](https://huggingface.co/Lorbus/Qwen3
 
 ## Status at a glance
 
-Six configurations + five v7.14 opt-in tiers, all measured end-to-end on a single 3090 PCIe / 230W cap with bench prompts (1000-token narrative essay + 800-token quicksort code), `vllm/vllm-openai:nightly-07351e0883470724dd5a7e9730ed10e01fc99d08` (vLLM `dev205+g07351e088`, Sandermage's reference target) + Genesis v7.54. **`v714` ships 48K + 0.92 by default** — passes all 10 verify-full.sh checks including tool-response prefill (#8) and long-context needle (#7). Pick by workload; if you push past 48K read the **Activation-memory caveat** below first.
+Five configurations + five opt-in tiers on the default, all measured end-to-end on a single 3090 PCIe / 230W cap with bench prompts (1000-token narrative essay + 800-token quicksort code), `vllm/vllm-openai:nightly-07351e0883470724dd5a7e9730ed10e01fc99d08` (vLLM `dev205+g07351e088`) + Genesis v7.54. **Default (`docker compose up -d`) is 48K + 0.92** — passes all 10 verify-full.sh checks. Pick by workload; if you push past 48K read the **Activation-memory caveat** below first.
 
 | Variant | Context | Narr TPS | Code TPS | Vision | Tools | Patches | VRAM | Notes |
 |---|---|---|---|---|---|---|---|---|
-| **v7.14** (`docker-compose.v714.yml`) — TQ + Genesis P65, **48K + 0.92** ⭐⭐ | **48K** | **50.9** | **67.5** | ✅ | ✅ | Genesis v7.14+ | 21.0 GB | **Production-safe default.** Below BOTH cliffs: GDN-forward (~50-60K single-prompt OOM) and TurboQuant tool prefill (~25K at high mem_util). All 10 verify-full.sh checks PASS. Vision + tools + MTP work. |
-| **v7.14 — opt-in 64K** (edit v714.yml: `max-model-len=64000`) | **64K** | 50.9 | 67.5 | ✅ | ✅ | Genesis v7.14+ | 21.5 GB | More chat-history room. Single prompts >~50K may OOM in GDN forward. Tool prefills ≤40K safe. |
-| **v7.14 — opt-in 96K + 0.93** | **96K** | 50.9 | 67.5 | ✅ | ✅ | Genesis v7.14+ | 22.0 GB | Useful for "long history, small individual prompts." Single prompts >~50K OOM. Tool prefills ≤30K. |
-| **v7.14 — opt-in 128K + 0.95** | **128K** | 50.9 | 67.5 | ✅ | ✅ | Genesis v7.14+ | 22.3 GB | Matches GPT-4 Turbo / DeepSeek-R1 ctx tier on paper. Single prompts >~50K OOM. Tool prefills ≤40K. |
-| **v7.14 — opt-in 192K + 0.98** | **192K** | 50.9 | 67.7 | ✅ | ✅ | Genesis v7.14+ | 22.3 GB | OOMs on ≥25K tool prefills ([#1](https://github.com/noonghunna/qwen36-27b-single-3090/issues/1) ampersandru's repro). Pick only if no big tool/doc prefills. |
-| **v7.14 — opt-in 205K text-only** (also uncomment `--language-model-only`) | **205K** | 50.1 | 65.8 | ❌ | ✅ | Genesis v7.14+ | 21.5 GB | Absolute single-card ceiling on TQ3 KV (engine reports 206,400 max at 0.98). Drops vision to free ~1 GB. Same prefill-OOM caveat as 192K. |
-| **Default** (`docker-compose.yml`) — fp8 KV + MTP n=3 ⭐ | 20K | **55.0** | **70.5** | ✅ | ✅ | Genesis | 22.3 GB | Best TPS at small ctx. fp8 KV sidesteps the cudagraph bug entirely. Pick when you only need ≤20K and want maximum TPS. |
-| **Tools-text** (`docker-compose.tools-text.yml`) — fp8 + 75K | 75K | 53.4 | 69.6 | ❌ | ✅ | Genesis | 22.2 GB | Drops vision to free KV pool. fp8 KV — cudagraph bug doesn't fire. Faster than v7.14 at ≤75K. |
-| **No-Genesis MTP** (`docker-compose.no-genesis-mtp.yml`) — fp8 + MTP, no patches | 20K | 54.7 | 68.2 | ✅ | ✅ | **none** | 22.3 GB | Identical to Default minus Genesis. Same TPS — Genesis is performance-neutral on the fp8+MTP path. Pick if you want to skip the patch tree. (Cross-rig peer: [u/sudeposutemizligi's TP=2 setup](#cross-rig-validation).) |
+| **Default** (`docker-compose.yml`) — TQ3 + Genesis P65 + MTP n=3, **48K + 0.92** ⭐⭐ | **48K** | **50.9** | **67.5** | ✅ | ✅ | Genesis v7.14+ | 21.0 GB | **What `docker compose up -d` boots.** Production-safe across the agent workload spectrum — below both prefill cliffs. All 10 verify-full.sh checks pass. Vision + tools + streaming + thinking + MTP all green. |
+| **Default — opt-in 64K** (edit `max-model-len=64000`) | **64K** | 50.9 | 67.5 | ✅ | ✅ | Genesis v7.14+ | 21.5 GB | More chat-history room. Single prompts >~50K may OOM. Tool prefills ≤40K safe. |
+| **Default — opt-in 96K + 0.93** | **96K** | 50.9 | 67.5 | ✅ | ✅ | Genesis v7.14+ | 22.0 GB | "Long history, small individual prompts." Single prompts >~50K OOM. Tool prefills ≤30K. |
+| **Default — opt-in 128K + 0.95** | **128K** | 50.9 | 67.5 | ✅ | ✅ | Genesis v7.14+ | 22.3 GB | GPT-4 Turbo / DeepSeek-R1 ctx tier on paper. Single prompts >~50K OOM. Tool prefills ≤40K. |
+| **Default — opt-in 192K + 0.98** | **192K** | 50.9 | 67.7 | ✅ | ✅ | Genesis v7.14+ | 22.3 GB | OOMs on ≥25K tool prefills ([#1](https://github.com/noonghunna/qwen36-27b-single-3090/issues/1) ampersandru's repro). Pick only if no big tool/doc prefills. |
+| **Default — opt-in 205K text-only** (also uncomment `--language-model-only`) | **205K** | 50.1 | 65.8 | ❌ | ✅ | Genesis v7.14+ | 21.5 GB | Absolute single-card ceiling on TQ3 KV (engine reports 206,400 max at 0.98). Drops vision to free ~1 GB. Same prefill-OOM caveat as 192K. |
+| **Fast-chat** (`docker-compose.fast-chat.yml`) — fp8 KV + MTP n=3 | 20K | **55.0** | **70.5** | ✅ | ✅ | Genesis | 22.3 GB | Best TPS at small ctx — pick for chat-only workloads ≤20K where you don't need 48K. fp8 KV sidesteps the cudagraph bug entirely. |
+| **Tools-text** (`docker-compose.tools-text.yml`) — fp8 + 75K | 75K | 53.4 | 69.6 | ❌ | ✅ | Genesis | 22.2 GB | **Best long-prompt path** — fp8 KV avoids the GDN cliff at 50-60K. Pick for long single prompts (RAG, summarization) when vision isn't needed. |
+| **No-Genesis MTP** (`docker-compose.no-genesis-mtp.yml`) — fp8 + MTP, no patches | 20K | 54.7 | 68.2 | ✅ | ✅ | **none** | 22.3 GB | Same as Fast-chat minus Genesis. Same TPS — Genesis is performance-neutral on the fp8+MTP path. Pick if you want to skip the patch tree. (Cross-rig peer: [u/sudeposutemizligi's TP=2 setup](#cross-rig-validation).) |
 | **Minimal** (`docker-compose.minimal.yml`) — no spec-decode, fp8 KV | 32K | 32.4 | 32.6 | ✅ | ✅ | **none** | 20.8 GB | Simplest stack. No spec-decode → no #40880 trigger. Pure-bandwidth ceiling. |
-| ~~**Long-ctx**~~ (`docker-compose.longctx-experimental.yml`) — DEPRECATED | ~~125K~~ | ~~37.9~~ | ~~49.8~~ | ✅ | ✅ | Genesis | 23.1 GB | **Superseded by v7.14.** Same effective working ceiling, lower TPS via `cudagraph_mode=NONE`. Kept for reference. |
 
 ### Activation-memory caveat (read this before raising `--max-model-len`)
 
@@ -94,12 +93,14 @@ In practice: **set max-model-len to your cliff (48K) for safety; let the agent f
 
 ### Decision tree (matched to use case)
 
-- **General chat / Q&A / quick coding (≤20K)** — **Default** (`docker-compose.yml`). 55 narrative / 70 code TPS, ✅ vision, ✅ tools, fp8 KV. Best TPS; no Cliff 2 risk because 20K stays well below 50K.
-- **Tool-using agents + multi-turn coding (≤48K)** — **v7.14 default** (`docker-compose.v714.yml`). 51/68 TPS with vision, full tool/streaming/thinking support, prefill-safe to 48K. **Recommended for anyone running Hermes / Cline / Roo / OpenAI Assistants on this stack.**
-- **Long single prompts (single-shot 50K+ summarization or RAG)** — **Tools-text** (`docker-compose.tools-text.yml`) at 75K + fp8. fp8 KV avoids the GDN cliff at 50-60K (tested through 60K depth). Trade-off: no vision.
-- **Frontier context (192K-205K) for "fits in giant book" use cases** — opt into v7.14 192K or 205K. Read the caveats first.
+- **Tool-using agents + multi-turn coding (≤48K)** — **Default** (`docker-compose.yml`). 51/68 TPS with vision, full tool/streaming/thinking support, prefill-safe to 48K. **Recommended for anyone running Hermes / Cline / Roo / Cursor / OpenAI Assistants on this stack.**
+- **Pure chat / Q&A at ≤20K, want maximum TPS** — **Fast-chat** (`docker-compose.fast-chat.yml`). 55 narrative / 70 code TPS, vision + tools work, fp8 KV. ~5-7% faster than the default for chat; no benefit on agent workloads where 20K is too tight.
+- **Long single prompts (50K+ summarization or RAG)** — **Tools-text** (`docker-compose.tools-text.yml`) at 75K + fp8. fp8 KV avoids the GDN cliff at 50-60K. Trade-off: no vision.
+- **Frontier context (128K-205K) for whole-codebase / long-doc workflows** — opt into the default's 128K / 192K / 205K tiers (edit `max-model-len` + `gpu-memory-utilization`). Read the caveats first.
 - **Simplest stack, no patches** — **Minimal** (`docker-compose.minimal.yml`). 32 TPS, no spec-decode, no Genesis. Zero risk.
-- **Skip Genesis but keep MTP TPS** — **No-Genesis MTP** (`docker-compose.no-genesis-mtp.yml`). Same 55/68 as Default.
+- **Skip Genesis but keep MTP TPS** — **No-Genesis MTP** (`docker-compose.no-genesis-mtp.yml`). Same 55/68 as Fast-chat.
+
+> 📚 **Per-use-case deep dives** (gotchas, limitations, tuning levers, examples) → [docs/USE_CASES.md](docs/USE_CASES.md)
 
 ### What's not working today
 
@@ -191,26 +192,25 @@ All 10 should print green checks (✓) or skips (⊘ for tests intentionally not
 
 ## Pick a compose variant
 
-Only one container can bind to port 8020 at a time — `docker compose down` before switching. All variants share the same pinned vLLM image digest. They differ in KV cache dtype, context length, vision, Genesis tree, spec-decode, and (for long-ctx) the `cudagraph_mode=NONE` workaround flag.
+Only one container can bind to port 8020 at a time — `docker compose down` before switching. All variants share the same pinned vLLM image digest. They differ in KV cache dtype, context length, vision, and Genesis-patch tree.
 
 ```bash
-# Default — 20K, vision, tools, fp8 KV, MTP n=3, Genesis  →  55 narr / 70 code TPS
+# Default — 48K, vision, tools, TQ3 KV, MTP n=3, Genesis v7.14  →  51 narr / 68 code TPS
+#           RECOMMENDED for ≥20K + tool-using agents.
 cd compose && docker compose up -d
 
-# Text-only — 75K, no vision, fp8 KV, MTP n=3, Genesis  →  53 narr / 70 code TPS
+# Default — opt-in 64K / 96K / 128K / 192K / 205K
+#           Edit max-model-len + gpu-memory-utilization in docker-compose.yml.
+#           See header comment block for the full envelope matrix + per-tier safe prefills.
+#           All opt-ins past 48K have prefill-OOM caveats — read the activation-memory section first.
+
+# Fast-chat — 20K, vision, tools, fp8 KV, MTP n=3, Genesis  →  55 narr / 70 code TPS
+#             Pick when you only need ≤20K and want maximum TPS.
+cd compose && docker compose -f docker-compose.fast-chat.yml up -d
+
+# Tools-text — 75K, no vision, fp8 KV, MTP n=3, Genesis  →  53 narr / 70 code TPS
+#              Pick for long single prompts (RAG, summarization) when vision isn't needed.
 cd compose && docker compose -f docker-compose.tools-text.yml up -d
-
-# v7.14 — 48K, vision, TQ3 KV, MTP n=3, Genesis P65  →  51 narr / 68 code TPS
-#         RECOMMENDED default for tool-using agents. Below GDN forward cliff;
-#         all 10 verify-full.sh checks pass. Engine rejects > 48K cleanly.
-cd compose && docker compose -f docker-compose.v714.yml up -d
-
-# v7.14 — opt-in 64K-205K (edit v714.yml: change max-model-len + mem-util)
-#         See header comment block in v714.yml for the full envelope matrix.
-#         All opt-ins at higher ctx have prefill-OOM caveats — read first.
-
-# Long-ctx (DEPRECATED — superseded by v7.14)
-# cd compose && docker compose -f docker-compose.longctx-experimental.yml up -d
 
 # No-Genesis MTP — 20K, vision, fp8 KV, MTP n=3, no patches  →  55 narr / 68 code TPS
 cd compose && docker compose -f docker-compose.no-genesis-mtp.yml up -d
@@ -296,7 +296,7 @@ n=4 barely beats n=3 on code peak but the position-4 draft accept collapses to 2
 
 ### Context ceiling
 
-`docker-compose.v714.yml` ships with **48K + `gpu-memory-utilization=0.92`** as the production-safe default. Below both prefill cliffs (see "Activation-memory caveat" above), all 10 verify-full.sh checks pass, oversized requests get a clean HTTP 400.
+`docker-compose.yml` ships with **48K + `gpu-memory-utilization=0.92`** as the production-safe default. Below both prefill cliffs (see "Activation-memory caveat" above), all 10 verify-full.sh checks pass, oversized requests get a clean HTTP 400.
 
 For deployments that need different trade-offs, the full envelope at lower mem-util values (measured 2026-04-28 on dev205 + Genesis v7.54, vision on, TQ3 KV):
 
@@ -310,9 +310,7 @@ For deployments that need different trade-offs, the full envelope at lower mem-u
 
 The `mem-util` choice **does not** raise Cliff 2 (GDN single-prompt OOM around 50-60K) — that's hardware-bound on a single 24 GB card with this hybrid architecture. Lowering `mem-util` only helps Cliff 1 (TurboQuant tool prefill).
 
-To push to 192K-205K (text only, with both prefill caveats): edit `v714.yml`, set `max-model-len=192000` (or 205000 + uncomment `--language-model-only`) and `gpu-memory-utilization=0.98`. Re-read the activation-memory caveat above before doing so.
-
-Older composes (`longctx-experimental.yml`, deprecated) cap at 125K because `cudagraph_mode=NONE` keeps inductor compiled scratch + a larger eager-decode footprint. v7.14's PIECEWISE downgrade for spec-decode reclaims that headroom.
+To push to 192K-205K (text only, with both prefill caveats): edit `docker-compose.yml`, set `max-model-len=192000` (or 205000 + uncomment `--language-model-only`) and `gpu-memory-utilization=0.98`. Re-read the activation-memory caveat above before doing so.
 
 ### Power cap
 
@@ -355,26 +353,26 @@ CVs are 0.4–4.2% across all configs — runs are tight. The 125K variant runs 
 
 Measured on 1× RTX 3090 at 230W cap, vLLM image pinned to tested digest, `scripts/verify-full.sh`:
 
-| Test | Default (MTP + fp8) | `tools-text.yml` (MTP + fp8, no vision) | `longctx-experimental.yml` (MTP + TQ3, cudagraph-off) |
+| Test | Default (TQ3 + Genesis P65, 48K) | Fast-chat (fp8 + MTP, 20K) | Tools-text (fp8 + MTP, 75K, no vision) |
 |---|---|---|---|
 | Server + Genesis patches | ✅ | ✅ | ✅ |
 | Basic completion (Paris) | ✅ | ✅ | ✅ |
-| **Tool calling** | **✅** | **✅** | **✅** (verified 2026-04-27 on Genesis v7.54 + dev205 — older "tool-call cascade" warning no longer applies) |
+| **Tool calling** | **✅** | **✅** | **✅** |
 | **Streaming (SSE)** | **✅** clean output | **✅** clean output | **✅** clean output |
 | Thinking / reasoning | ✅ | ✅ | ✅ |
-| **Long-context recall** (10K) | **✅** | **✅** | **✅** |
-| Long-context recall (30K) | n/a (20K cap) | **✅** | **✅** |
-| Long-context recall (60K) | n/a | **✅** | **✅** |
-| Long-context recall (90K) | n/a | n/a (75K cap) | **✅** |
-| Narrative TPS (1000 tok) | **55.0** (CV 2.9%) | 53.4 (CV 2.6%) | 37.9 (CV 4.2%) |
-| Code TPS (800 tok quicksort) | **70.5** (CV 1.2%) | 69.6 (CV 0.7%) | 49.8 (CV 1.4%) |
-| TTFT (narr / code) | 148 / 147 ms | 148 / 149 ms | 171 / 172 ms |
-| Mean AL · accept (code) | 3.33–3.45 · 77–82% | 3.31–3.51 · 77–83% | 3.40–3.49 · 80–83% |
-| Max context | 20K | **75K** | **125K** |
-| Vision | ✅ | ❌ | ✅ |
-| VRAM | 22.3 GB | 22.2 GB | 23.1 GB |
-
-**The original 125K headline (~85–95 TPS) was reproducible only on workloads that don't exercise structured output:** plain narrative or code generation. Tool calls, long-context recall, and streaming all fail catastrophically with cudagraph on under MTP spec-decode. The nine-probe ladder in [Technical background](#technical-background--whats-broken-upstream-and-why-we-work-around-it) below isolates the bug to the CUDA graph capture/replay layer specifically; Triton kernels and torch.compile inductor output are correct when invoked dynamically. The ngram path is now fixed upstream (closed for ngram in #40831 via Sander's v7.13 + #40875); MTP remains tracked at [#40880](https://github.com/vllm-project/vllm/issues/40880).
+| **Tool-response prefill** (~25K-token tool message) | **✅** | n/a (20K cap) | **✅** |
+| **Output quality / cascade** (2K-token completion) | **✅** clean | **✅** clean | **✅** clean |
+| **MTP acceptance length** | **✅** AL ≥ 2.0 | **✅** AL ≥ 2.0 | **✅** AL ≥ 2.0 |
+| Long-context recall (10K) | **✅** | **✅** | **✅** |
+| Long-context recall (30K) | **✅** | n/a (20K cap) | **✅** |
+| Long-context recall (60K) | n/a (engine HTTP 400 — clean) | n/a | **✅** |
+| Narrative TPS (1000 tok) | **50.9** (CV 2.4%) | **55.0** (CV 2.9%) | 53.4 (CV 2.6%) |
+| Code TPS (800 tok quicksort) | **67.5** (CV 2.2%) | **70.5** (CV 1.2%) | 69.6 (CV 0.7%) |
+| TTFT (narr / code) | 153 / 153 ms | 148 / 147 ms | 148 / 149 ms |
+| Mean AL · accept (code) | 3.48 · 83% | 3.33–3.45 · 77–82% | 3.31–3.51 · 77–83% |
+| Max context | **48K** (opt-in to 205K) | 20K | **75K** |
+| Vision | ✅ | ✅ | ❌ |
+| VRAM | 21.0 GB | 22.3 GB | 22.2 GB |
 
 ---
 
@@ -407,17 +405,13 @@ You edited `--max-num-batched-tokens`. Keep it ≥ 4128 for this context length 
 
 Cross-reference the [Status at a glance](#status-at-a-glance) table for the variant you booted. Common cases:
 
-- **You're on `longctx-experimental.yml` and seeing ~38 narr / 50 code TPS** — expected. `cudagraph_mode=NONE` keeps inductor compilation on but disables graph capture; that's the cost of correctness at 125K. Use Default for max TPS at ≤20K.
 - **You're on `minimal.yml` and seeing ~32 TPS** — expected. No spec-decode means no MTP boost.
-- **You're on Default and seeing <50 narr or <65 code** — patch likely didn't apply. Check `docker logs vllm-qwen36-27b 2>&1 | grep "Genesis Results"` (should show `26 applied / 37 skipped / 0 failed`) and `grep "tolist_cudagraph"` (should show site A + site B applied).
+- **You're on the default (48K, TQ3) and seeing <45 narr or <60 code** — Genesis or `tolist_cudagraph` patch likely didn't apply. Check `docker logs vllm-qwen36-27b 2>&1 | grep "Genesis Results"` (should show `27 applied / 36 skipped / 0 failed`) and `grep "tolist_cudagraph"` (should show site A + site B applied).
+- **You're on Fast-chat (20K, fp8) and seeing <50 narr or <65 code** — same patch check; Fast-chat also depends on Genesis for vision-tower hybrid handling.
 
 ### Tool calls return `<tool_call>{...}</tool_call>` as plain text (tool extraction doesn't fire)
 
-Two possible causes; the logs distinguish them:
-
-**Cause A — you removed `cudagraph_mode=NONE` from the long-ctx compose.** The original 125K config (cudagraph on) hits [#40831](https://github.com/vllm-project/vllm/issues/40831) and produces `<tool_call>` loops. The shipped `docker-compose.longctx-experimental.yml` already includes the cudagraph-off workaround; if you stripped that flag for performance, restore it.
-
-**Cause B — Genesis patch anchor drift.** Check container logs for:
+This is the silent MTP × TurboQuant cascade bug — fixed by Genesis v7.14's P65 patch, which the default compose loads. If you're seeing this on the default compose, Genesis didn't apply correctly. Check container logs for:
 
 ```
 [INFO:genesis.apply_all] Genesis Results: <N> applied, <M> skipped, <K> failed
@@ -438,26 +432,26 @@ docker run --rm --entrypoint python3 \
 
 ```
 qwen36-27b-single-3090/
-├── README.md                                   (this file)
+├── README.md                                   (this file — start here)
+├── CHANGELOG.md                                dated history of major changes
 ├── LICENSE                                     Apache-2.0
-├── .gitignore
+├── docs/
+│   ├── INTERNALS.md                            deep technical: why this works, 9-probe bug isolation, upstream tracking
+│   └── USE_CASES.md                            per-workload guides: chat, coding, agents, RAG, vision, frontier
 ├── patches/
 │   ├── patch_tolist_cudagraph.py               our CUDA graph capture crash fix (#40807)
-│   ├── patch_pr40798_workspace.py              research artifact — backports vllm#40798;
-│   │                                            does NOT fix #40831 (probe 8); kept for
-│   │                                            reproducibility of the negative result
+│   ├── patch_pr40798_workspace.py              research artifact — backports vllm#40798 (kept for negative-result reproducibility)
 │   └── genesis/                                (gitignored; fetched by setup.sh)
 ├── compose/
-│   ├── docker-compose.yml                      DEFAULT — fp8 + MTP + vision + Genesis, 20K, 55 narr / 70 code TPS
+│   ├── docker-compose.yml                      ⭐ DEFAULT — TQ3 + MTP + Genesis P65, 48K vision (opt-in 64K-205K), 51 narr / 68 code TPS
+│   ├── docker-compose.fast-chat.yml            fp8 + MTP + Genesis, 20K, 55 narr / 70 code TPS — fastest at small ctx
 │   ├── docker-compose.tools-text.yml           fp8 + MTP + Genesis, no vision, 75K, 53 narr / 70 code TPS
-│   ├── docker-compose.v714.yml                 ⭐ TQ3 + MTP + Genesis P65, 48K default vision (opt-in 64K-205K), 51 narr / 68 code TPS
-│   ├── docker-compose.no-genesis-mtp.yml       fp8 + MTP, no patches, 20K, 55 narr / 68 code TPS
-│   ├── docker-compose.minimal.yml              fp8, no spec-decode, 32K, 32 narr / 33 code TPS
-│   └── docker-compose.longctx-experimental.yml DEPRECATED — superseded by v714 (default 48K, opt-in to higher)
+│   ├── docker-compose.no-genesis-mtp.yml       fp8 + MTP, no patches, 20K, 55 narr / 68 code TPS — control variant
+│   └── docker-compose.minimal.yml              fp8, no spec-decode, 32K, 32 narr / 33 code TPS — simplest stack
 └── scripts/
     ├── setup.sh                                clone Genesis + download model + SHA verify
     ├── verify.sh                               quick smoke test (~10 sec)
-    ├── verify-full.sh                          full functional test — streaming, thinking, needle (~3 min)
+    ├── verify-full.sh                          full functional test — 10 checks (~3 min)
     └── bench.sh                                canonical TPS bench
 ```
 
@@ -514,7 +508,7 @@ Quick definitions of terms used throughout this README. If you've used local LLM
 ## Credits
 
 - **Qwen team** (@Alibaba_Qwen) — for the base model and a usable MTP head architecture
-- **Lorbus** — for the AutoRound INT4 quant with preserved BF16 `mtp.fc`
+- **[Lorbus](https://huggingface.co/Lorbus/Qwen3.6-27B-int4-AutoRound)** — for the AutoRound INT4 quant with preserved BF16 `mtp.fc` (the model this whole stack runs on)
 - **[Sandermage](https://github.com/Sandermage/genesis-vllm-patches)** — for the Genesis patch set that made TurboQuant work on hybrid models on consumer Ampere; for independently reproducing #40831 on a different rig (2× A5000 + Qwen3-Next-35B-A3B-FP8 + ngram), confirming the cudagraph-off workaround, and engaging honestly with each negative result during the probe ladder
 - **[vibhavagarwal5](https://github.com/vllm-project/vllm/pull/38479)** — for the original TurboQuant landing PR and the [tracking issue #40069](https://github.com/vllm-project/vllm/issues/40069) that made the spec-decode-unverified status visible upfront
 - **vLLM project** — for shipping TurboQuant and actively maintaining the backend

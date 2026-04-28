@@ -1,0 +1,121 @@
+# ===========================================================================
+# Default — the config we recommend for general use.
+#
+# This config PASSES every test in scripts/verify-full.sh:
+#   server  genesis  Paris  tool-calls  streaming  thinking  needle-recall
+#
+# Config: MTP spec-decode n=3 + fp8_e5m2 KV + vision enabled.
+#
+# Variant matrix (all three compose files in this dir):
+#
+#   Compose file                               Max ctx   Narr TPS   Code TPS   Tools   Vision   Status
+#   docker-compose.yml (this file, default)     20K        66         84         ✅       ✅       validated
+#   docker-compose.tools-text.yml                75K        65         84         ✅       ❌       validated
+#   docker-compose.longctx-experimental.yml    125K        92         95         ✗        ✅       ⚠ see file
+#
+# The experimental variant uses TurboQuant KV to fit a 125K KV pool, which
+# benchmarks faster but fails on tool calls, long-context recall, and some
+# structured-output tasks (degenerate token loops). See the file header of
+# docker-compose.longctx-experimental.yml and README § Known issues.
+#
+# Run with:
+#   cd compose
+#   docker compose up -d
+# ===========================================================================
+services:
+  vllm-qwen36-27b:
+    # Pinned to the exact nightly we tested and the Genesis patches verified against.
+    image: vllm/vllm-openai:nightly-07351e0883470724dd5a7e9730ed10e01fc99d08
+    container_name: vllm-qwen36-27b
+    restart: "no"
+    ports:
+      - "8020:8000"
+    volumes:
+      - ${MODEL_DIR:-../models}:/root/.cache/huggingface
+      # Genesis v7.14+ modular package (mounted into vLLM's site-packages).
+      # Replaces the old patch_genesis_unified.py shim path which Sandermage
+      # removed when migrating to the modular layout. Apply via
+      # `python3 -m vllm._genesis.patches.apply_all` at boot.
+      - ../patches/genesis/vllm/_genesis:/usr/local/lib/python3.12/dist-packages/vllm/_genesis:ro
+      # Standalone .tolist() cudagraph capture-guard fix (separate bug from
+      # any single Genesis patch). Equivalent functionality also ships as
+      # Genesis P78 since v7.14 (with attribution); both running together
+      # is harmless (idempotent), running just one is sufficient.
+      - ../patches/patch_tolist_cudagraph.py:/patches/patch_tolist_cudagraph.py:ro
+    environment:
+      # Uncomment the next line to pin to a specific GPU (e.g. GPU 0):
+      # - CUDA_VISIBLE_DEVICES=0
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      - VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - NCCL_CUMEM_ENABLE=0
+      - NCCL_P2P_DISABLE=1
+      - VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1
+      - VLLM_NO_USAGE_STATS=1
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512
+      - VLLM_FLOAT32_MATMUL_PRECISION=high
+      - VLLM_USE_FLASHINFER_SAMPLER=1
+      - OMP_NUM_THREADS=1
+      - CUDA_DEVICE_MAX_CONNECTIONS=8
+      - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+      - VLLM_MARLIN_USE_ATOMIC_ADD=1
+      # Genesis v7.14+ opt-in patches relevant to fp8 KV + MTP path.
+      # We don't enable P4 (TurboQuant-hybrid) — fp8 KV doesn't need it.
+      # We don't enable P65/P67 — fp8 KV doesn't trigger #40880 cudagraph bug.
+      - GENESIS_ENABLE_P64_QWEN3CODER_MTP_STREAMING=1
+      - GENESIS_ENABLE_P68_AUTO_FORCE_TOOL=1
+      - GENESIS_ENABLE_P69_LONG_CTX_TOOL_REMINDER=1
+    shm_size: "16gb"
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+        pip install xxhash pandas scipy -q
+        python3 -m vllm._genesis.patches.apply_all
+        python3 /patches/patch_tolist_cudagraph.py
+        exec vllm serve "$@"
+      - --
+    command:
+      - --model
+      - /root/.cache/huggingface/qwen3.6-27b-autoround-int4
+      - --served-model-name
+      - qwen3.6-27b-autoround
+      - --quantization
+      - auto_round
+      - --dtype
+      - float16
+      - --tensor-parallel-size
+      - "1"
+      - --max-model-len
+      - "20000"
+      - --gpu-memory-utilization
+      - "0.95"
+      - --max-num-seqs
+      - "1"
+      - --max-num-batched-tokens
+      - "2048"
+      # fp8_e5m2 KV — NOT turboquant — because MTP + turboquant collapses on tool-call prompts.
+      - --kv-cache-dtype
+      - fp8_e5m2
+      - --trust-remote-code
+      - --reasoning-parser
+      - qwen3
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+      - --enable-prefix-caching
+      - --enable-chunked-prefill
+      - --speculative-config
+      - '{"method":"mtp","num_speculative_tokens":3}'
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"

@@ -1,30 +1,84 @@
 # ===========================================================================
-# Default — the config we recommend for general use.
+# DEFAULT compose for Qwen3.6-27B on a single RTX 3090.
 #
-# This config PASSES every test in scripts/verify-full.sh:
-#   server  genesis  Paris  tool-calls  streaming  thinking  needle-recall
+# Stack: vLLM + Sandermage's Genesis v7.14 patches + TurboQuant 3-bit KV
+# + MTP n=3 speculative decoding + vision tower.
 #
-# Config: MTP spec-decode n=3 + fp8_e5m2 KV + vision enabled.
+# This compose ships the production-safe defaults (48K context, 0.92 mem-util)
+# below both prefill-activation cliffs found on this hardware. All 10
+# verify-full.sh checks pass at this combo. Vision, tool calls, streaming,
+# thinking, MTP — all green.
 #
-# Variant matrix (all three compose files in this dir):
+# Genesis v7.14 P65 closes vllm-project/vllm#40880 (silent <tool_call>
+# cascade under MTP × TurboQuant × cudagraph) by forcing PIECEWISE cudagraph
+# for spec-decode → eager continuation runs the correct branch. P66 filters
+# capture sizes; P64 fixes streaming tool-call edge case; P68/P69 long-ctx
+# tool-format adherence (env-opt-in).
 #
-#   Compose file                               Max ctx   Narr TPS   Code TPS   Tools   Vision   Status
-#   docker-compose.yml (this file, default)     20K        66         84         ✅       ✅       validated
-#   docker-compose.tools-text.yml                75K        65         84         ✅       ❌       validated
-#   docker-compose.longctx-experimental.yml    125K        92         95         ✗        ✅       ⚠ see file
+# Two prefill-activation cliffs make 24 GB-card defaults non-trivial (verified 2026-04-28):
 #
-# The experimental variant uses TurboQuant KV to fit a 125K KV pool, which
-# benchmarks faster but fails on tool calls, long-context recall, and some
-# structured-output tasks (degenerate token loops). See the file header of
-# docker-compose.longctx-experimental.yml and README § Known issues.
+# CLIFF 1 — TurboQuant attention scratch + tool-response prefill
+#   Trigger: ≥25K total prompt with TQ3 KV at high mem_util.
+#   Site:    turboquant_attn forward, dequant scratch + mid_o/output buffers.
+#   Symptom: CUDA OOM allocating ~138 MiB; engine dies mid-request.
+#   Why:    fits the bug ampersandru reported in #1 (Hermes news-fetch, 20K+
+#           token tool response stuffed back into the conversation).
+#
+# CLIFF 2 — DeltaNet/GLA recurrent state buffer
+#   Trigger: single prompt above ~50-60K tokens (regardless of tool use).
+#   Site:    fla.ops.chunk.chunk_gated_delta_rule_fwd_h.h.new_empty(B, NT, H, V, K)
+#           where NT = ceil(seq_len / chunk_size) — grows with prompt length.
+#   Symptom: CUDA OOM allocating ~50-740 MiB during forward; engine dies.
+#   Why:    Qwen3-Next is hybrid (16 attention + 48 GDN layers). GDN state
+#           is sized by total seq_len, not chunk size — chunked-prefill
+#           doesn't help. We can't fix this short of multi-GPU or upstream
+#           kernel changes.
+#
+# vLLM's `--gpu-memory-utilization` is a hard cap with no soft fallback or
+# circular eviction. Everything outside the cap — prefill activation peaks,
+# fragmentation, kernel scratch — has to fit in `(1 - mem_util) × 24 GB`.
+# vLLM's pre-check guarantees the steady-state KV fits, not the activation
+# peak during forward.
+#
+# Measured envelope on dev205 + Genesis v7.54 (1× 3090 24 GB, vision on, TQ3 KV):
+#
+#   max-model-len   mem-util    boots?   safe single-prompt    notes
+#   ────────────────────────────────────────────────────────────────────────────
+#    48,000          0.92       ✅       up to 48K               ⭐ default — verify-full.sh ALL 10 PASS
+#    64,000          0.92       ✅       up to ~50K               needle scale=900 (~58K) OOMs
+#    96,000          0.93       ✅       up to ~50K               needle scale=900 OOMs
+#   128,000          0.95       ✅       up to ~40K (tool only)   #7 needle 60K+ OOMs, #8 ≤40K passes
+#   192,000          0.98       ✅       up to ~16K               #8 OOMs on 25K+ tool prefill (ampersandru)
+#   205,000          0.98 + no vision    up to ~16K               same as 192K + drops vision
+#
+# This variant ships **48K + 0.92** as the production default — verify-full.sh
+# passes all 10 checks (including the long-context needle at 10K + 30K depths,
+# tool-prefill OOM at 25K+, and MTP acceptance ≥2.0). 48K covers chat history
+# accumulation, single-file coding, tool-using agent flows up to ~30K tool
+# responses, and document analysis up to ~40K input.
+#
+# Above-cliff requests get a CLEAN HTTP 400 from the engine pre-check (not an
+# OOM crash). To push higher and accept the risk, see the opt-in matrix above
+# and the README "Activation memory caveat" section.
+#
+# Variant matrix (measured on dev205 + Genesis v7.54):
+#
+#   docker-compose.yml             (THIS — default)   48K   51/68 TPS  vision  ⭐ All features safe; opt-in 64K-205K with caveats
+#   docker-compose.fast-chat.yml                       20K   55/70 TPS  vision     Fastest TPS for chat; fp8 KV
+#   docker-compose.tools-text.yml                      75K   53/70 TPS  no vis     Long prompts (60K+) with fp8 — vision off
+#   docker-compose.no-genesis-mtp.yml                  20K   55/68 TPS  vision     Same as fast-chat minus Genesis patches
+#   docker-compose.minimal.yml                         32K   32/33 TPS  vision     Simplest stack; no spec-decode
+#
+# Upstream tracker: vllm-project/vllm#40880 (Sandermage's root-cause + v7.14
+# patches). Proper kernel fix (P67) designed-but-not-implemented; v7.14 is
+# a workaround until that lands.
 #
 # Run with:
-#   cd compose
-#   docker compose up -d
+#   bash ../scripts/setup.sh    # ensures Genesis tree at v7.14+ layout
+#   cd compose && docker compose up -d
 # ===========================================================================
 services:
   vllm-qwen36-27b:
-    # Pinned to the exact nightly we tested and the Genesis patches verified against.
     image: vllm/vllm-openai:nightly-07351e0883470724dd5a7e9730ed10e01fc99d08
     container_name: vllm-qwen36-27b
     restart: "no"
@@ -32,15 +86,12 @@ services:
       - "8020:8000"
     volumes:
       - ${MODEL_DIR:-../models}:/root/.cache/huggingface
-      # Genesis v7.14+ modular package (mounted into vLLM's site-packages).
-      # Replaces the old patch_genesis_unified.py shim path which Sandermage
-      # removed when migrating to the modular layout. Apply via
-      # `python3 -m vllm._genesis.patches.apply_all` at boot.
+      # Genesis v7.14 modular package (mounted into vLLM's site-packages).
+      # Apply via `python3 -m vllm._genesis.patches.apply_all` at boot.
       - ../patches/genesis/vllm/_genesis:/usr/local/lib/python3.12/dist-packages/vllm/_genesis:ro
-      # Standalone .tolist() cudagraph capture-guard fix (separate bug from
-      # any single Genesis patch). Equivalent functionality also ships as
-      # Genesis P78 since v7.14 (with attribution); both running together
-      # is harmless (idempotent), running just one is sufficient.
+      # Standalone .tolist() cudagraph capture fix — separate bug from P65.
+      # Different bug class: P65 fixes cu_seqlens_k=cu_seqlens_q misclassification;
+      # this fix guards .tolist() syscalls during capture.
       - ../patches/patch_tolist_cudagraph.py:/patches/patch_tolist_cudagraph.py:ro
     environment:
       # Uncomment the next line to pin to a specific GPU (e.g. GPU 0):
@@ -58,11 +109,13 @@ services:
       - CUDA_DEVICE_MAX_CONNECTIONS=8
       - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
       - VLLM_MARLIN_USE_ATOMIC_ADD=1
-      # Genesis v7.14+ opt-in patches relevant to fp8 KV + MTP path.
-      # We don't enable P4 (TurboQuant-hybrid) — fp8 KV doesn't need it.
-      # We don't enable P65/P67 — fp8 KV doesn't trigger #40880 cudagraph bug.
-      - GENESIS_ENABLE_P64_QWEN3CODER_MTP_STREAMING=1
-      - GENESIS_ENABLE_P68_AUTO_FORCE_TOOL=1
+      # Genesis v7.14 opt-in patches — these are OFF by default and must be
+      # enabled per-process. Without these, v7.14 produces the same cudagraph
+      # behavior as v7.13 (silent tool-call cascade).
+      - GENESIS_ENABLE_P65_TURBOQUANT_SPEC_CG_DOWNGRADE=1   # core fix for #40880
+      - GENESIS_ENABLE_P66_CUDAGRAPH_SIZE_FILTER=1           # capture-size divisibility
+      - GENESIS_ENABLE_P64_QWEN3CODER_MTP_STREAMING=1        # streaming tool-call edge case
+      - GENESIS_ENABLE_P68_AUTO_FORCE_TOOL=1                 # long-ctx tool adherence
       - GENESIS_ENABLE_P69_LONG_CTX_TOOL_REMINDER=1
     shm_size: "16gb"
     ipc: host
@@ -94,17 +147,33 @@ services:
       - float16
       - --tensor-parallel-size
       - "1"
+      # 48K + 0.92 — production default. Below BOTH cliffs:
+      #   - GDN forward (single-prompt OOM at ~50-60K tokens) → 48K stays safely under
+      #   - TurboQuant tool prefill (OOM at high mem_util + big tool responses) → 0.92 leaves ~1.9 GB headroom
+      # Engine REJECTS oversized requests with HTTP 400 (clean), no crashes.
+      # Verify-full.sh ALL 10 checks pass at this combo (2026-04-28).
+      #
+      # To push higher (with caveats — read the comment block at the top of
+      # this file + the README Activation memory caveat first):
+      #   - 64K + 0.92  → up to ~50K single prompts safe (most agent flows)
+      #   - 96K + 0.93  → up to ~40-50K; #7 needle scale=900 OOMs in GDN
+      #   - 128K + 0.95 → up to ~40K tool prefill, single prompts >50K may OOM
+      #   - 192K + 0.98 → up to ~16K prefills only — ampersandru-class workload
+      #   - 205K + 0.98 + --language-model-only (uncomment below) → text-only frontier
       - --max-model-len
-      - "20000"
+      - "48000"
       - --gpu-memory-utilization
-      - "0.95"
+      - "0.92"
       - --max-num-seqs
       - "1"
       - --max-num-batched-tokens
-      - "2048"
-      # fp8_e5m2 KV — NOT turboquant — because MTP + turboquant collapses on tool-call prompts.
+      - "4128"
       - --kv-cache-dtype
-      - fp8_e5m2
+      - turboquant_3bit_nc
+      # For maximum context (205K instead of 192K), uncomment the next line
+      # to drop the vision tower. Frees ~1 GB VRAM, lifts engine ceiling
+      # from 192K to ~206K. Trade-off: text-only.
+      #- --language-model-only
       - --trust-remote-code
       - --reasoning-parser
       - qwen3
@@ -113,8 +182,13 @@ services:
       - qwen3_coder
       - --enable-prefix-caching
       - --enable-chunked-prefill
+      - --no-scheduler-reserve-full-isl
       - --speculative-config
       - '{"method":"mtp","num_speculative_tokens":3}'
+      # cudagraph_mode left at vLLM default. Genesis v7.14 P65 auto-downgrades
+      # FULL_AND_PIECEWISE → PIECEWISE for spec-decode K+1 verify; 1-token
+      # decode batches still get cudagraph capture. Forcing FULL_AND_PIECEWISE
+      # explicitly produces no measurable benefit (verified 2026-04-27).
       - --host
       - 0.0.0.0
       - --port
