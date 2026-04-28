@@ -1,12 +1,49 @@
 # Qwen3.6-27B on a single RTX 3090
 
-**A validated recipe for serving Qwen3.6-27B on a single consumer 24 GB RTX 3090** — full OpenAI API, vision, tool calling, streaming, speculative decoding, all verified end-to-end via `scripts/verify-full.sh`.
+**Run the Qwen3.6-27B language model — with vision and tool calling — on one consumer GPU.** No cloud, no API bills. Drop-in replacement for ChatGPT/Claude in any tool that uses the OpenAI SDK.
 
-Based on [`Lorbus/Qwen3.6-27B-int4-AutoRound`](https://huggingface.co/Lorbus/Qwen3.6-27B-int4-AutoRound) via vLLM with MTP speculative decoding + fp8_e5m2 KV cache. Built on [`Sandermage/genesis-vllm-patches`](https://github.com/Sandermage/genesis-vllm-patches) + a CUDA graph capture fix that ships in this repo.
+---
 
-> 📖 **Write-up:** *[Qwen3.6-27B on a single RTX 3090 — the recipe](https://medium.com/)*
-> 🤝 **Companion repo:** [qwen36-dual-3090](https://github.com/noonghunna/qwen36-dual-3090) — same model on 2× 3090 (TP=2 with vision + 4-stream concurrency at 262K).
-> 🐛 **Upstream bug reports:** [vllm-project/vllm#40807](https://github.com/vllm-project/vllm/issues/40807) (CUDA graph crash — worked around locally) · [vllm-project/vllm#40831](https://github.com/vllm-project/vllm/issues/40831) (TurboQuant × spec-decode output corruption — closed for ngram path via @Sandermage's v7.13 + [#40875](https://github.com/vllm-project/vllm/issues/40875) `prompt_lookup_min=8` config) · [vllm-project/vllm#40880](https://github.com/vllm-project/vllm/issues/40880) (MTP × TurboQuant × cudagraph — **root-caused by @Sandermage 2026-04-25, fixed in [Genesis v7.14](https://github.com/Sandermage/genesis-vllm-patches) via P65 cudagraph downgrade for spec-decode**; our `cudagraph_mode=NONE` workaround in `docker-compose.longctx-experimental.yml` still works at -60% TPS, but v7.14 is now the recommended fix)
+## TL;DR — what you'll get
+
+- A 27-billion-parameter model running locally on **one RTX 3090** (24 GB VRAM)
+- **OpenAI-compatible API** on `http://localhost:8020` — point any OpenAI SDK at it (Open WebUI, LM Studio frontends, Cline, Cursor, your own scripts)
+- **All the features** from the OpenAI API: chat, vision (images in prompts), tool calling, streaming, reasoning mode
+- **~50–70 tokens/second** generation speed (faster than most cloud APIs at low concurrency)
+- **48K-token context** by default (configurable up to 205K with caveats — see below)
+- One `docker compose up -d` after a one-time ~20 GB model download
+
+**First time here?** → Jump to [**Quick start**](#quick-start).
+**Got it running, want to compare configs?** → [Status at a glance](#status-at-a-glance).
+**Hit an error?** → [Troubleshooting](#troubleshooting).
+**Don't know what TPS / KV / MTP mean?** → [Glossary](#glossary) at the bottom.
+
+---
+
+## Will this work for you?
+
+| You'll need | Notes |
+|---|---|
+| 1× NVIDIA RTX 3090 (24 GB) | Larger Ampere/Ada cards (4090, A6000, etc.) work too. Lower VRAM cards (3060, 3080 12 GB) don't fit. |
+| ~30 GB free disk | Model weights are 18 GB; the rest is Docker layers + scratch. |
+| Linux (Ubuntu 22.04+ tested) | macOS/Windows won't work — vLLM is Linux + CUDA only. WSL2 *should* work but isn't tested by us. |
+| Docker + NVIDIA Container Toolkit | If `docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu22.04 nvidia-smi` shows your GPU, you're good. |
+| NVIDIA driver 580.x+ | For the CUDA 13 runtime in vLLM nightly. Run `nvidia-smi` to check. |
+| Comfort with the terminal | You'll edit a YAML file once and run a few `docker compose` commands. |
+
+**You're probably fine if:** you've used the OpenAI API before, you can run a Docker container with GPUs, and you have ~30 minutes for the first-time setup.
+
+**Try something simpler first if:** you've never run a local LLM. [Ollama](https://ollama.com) is more forgiving and supports Qwen3 too — though it won't give you vision, MTP speculative decoding, or full OpenAI API parity.
+
+---
+
+## How this is built (one-paragraph version)
+
+We use [`Lorbus/Qwen3.6-27B-int4-AutoRound`](https://huggingface.co/Lorbus/Qwen3.6-27B-int4-AutoRound) — a 4-bit quantized version of Alibaba's Qwen3.6-27B that fits in 24 GB. It runs on [vLLM](https://github.com/vllm-project/vllm) (a fast inference engine) with [Sandermage's Genesis patches](https://github.com/Sandermage/genesis-vllm-patches) (which fix several upstream Qwen3-Next bugs) plus a small in-repo patch for CUDA graph capture. The result is a stack with full feature parity to the cloud API at a small fraction of the cost.
+
+> 📖 **Long-form write-up:** *[Qwen3.6-27B on a single RTX 3090 — the recipe](https://medium.com/)*
+> 🤝 **Companion repo:** [qwen36-dual-3090](https://github.com/noonghunna/qwen36-dual-3090) — same model on 2× 3090 (262K context, 4-stream concurrency).
+> 🐛 **Upstream bugs we hit & worked around:** [vllm#40807](https://github.com/vllm-project/vllm/issues/40807) (CUDA graph crash) · [vllm#40831](https://github.com/vllm-project/vllm/issues/40831) (TurboQuant × spec-decode corruption) · [vllm#40880](https://github.com/vllm-project/vllm/issues/40880) (MTP × TurboQuant cudagraph — fixed in Genesis v7.14)
 
 ---
 
@@ -64,33 +101,13 @@ In practice: **set max-model-len to your cliff (48K) for safety; let the agent f
 - **Simplest stack, no patches** — **Minimal** (`docker-compose.minimal.yml`). 32 TPS, no spec-decode, no Genesis. Zero risk.
 - **Skip Genesis but keep MTP TPS** — **No-Genesis MTP** (`docker-compose.no-genesis-mtp.yml`). Same 55/68 as Default.
 
-### Removed: eager.yml
+### What's not working today
 
-`docker-compose.eager.yml` was originally proposed by [@ampersandru](https://github.com/ampersandru) in [#1](https://github.com/noonghunna/qwen36-27b-single-3090/issues/1) as a 125K path that bypasses the cudagraph bug class via `--enforce-eager`. It shipped briefly with a "~52-65 TPS at 125K" claim. **Re-bench cycle on dev205 + Genesis v7.54 measured 25.5 narr / 32.3 code — strictly dominated by `longctx-experimental.yml` at the same 125K context (38/50 TPS).** `--enforce-eager` disables both cudagraph AND torch.compile, paying a real Python-overhead cost on every forward; `cudagraph_mode=NONE` keeps inductor compilation on and is faster while delivering the same context ceiling and feature set. The compose has been removed in favor of long-ctx as the recommended 125K path. Eager mode is still reachable via `--compilation-config '{"cudagraph_mode":"NONE"}' --enforce-eager` if you genuinely need the full no-graph escape hatch (e.g., for model debugging or P7 GDN dual-stream), but no shipped variant defaults to it.
+- **125K context at FULL cudagraph speed (~95 TPS) WITH tool calls** — would require the proper P67 multi-query Triton kernel (designed-but-not-implemented). Until then, you pick two of three: long ctx, full TPS, working tools.
+- **GGUF on vLLM for Qwen3-Next family** — not supported upstream yet. Use llama.cpp or Ollama if you specifically need GGUF.
 
-### What v7.14 changes (the new variant)
-
-[Sandermage's v7.14](https://github.com/Sandermage/genesis-vllm-patches) shipped 2026-04-25 with the P65 patch root-causing #40880: `TurboQuantAttentionImpl._prefill_attention`'s cudagraph-capture bypass treats spec-decode K+1 verify batches as first-chunk prefill (sets `cu_seqlens_k = cu_seqlens_q`), so the captured kernel ignores cached KV. Drafter and verifier both produce noise from the kernel-without-context path; for tool-call prompts they converge on the same high-bias special token (`<tool_call>`) and cascade.
-
-P65 downgrades `_cudagraph_support` from `UNIFORM_BATCH` to `UNIFORM_SINGLE_TOKEN_DECODE`. vLLM's compilation auto-detects and forces `cudagraph_mode=PIECEWISE` for spec-decode → eager continuation runs the correct branch. 1-token decode batches still get piecewise capture; only K+1 spec-verify batches go eager.
-
-This is a workaround. The proper fix is a custom multi-query Triton kernel (P67) that handles K+1 query against compressed cached KV under cudagraph capture — designed-but-not-implemented in v7.14.
-
-### What's NOT working today
-
-- **125K context at FULL cudagraph speed (~95 TPS) WITH tool calls** — that combination requires the proper P67 kernel. Until then, you pick two of three: long ctx, full TPS, working tools.
-- **GGUF on vLLM for Qwen3-Next family** — not supported upstream yet (4 PRs open + a missing port of `Qwen35TensorProcessor` value transforms). Use llama.cpp / Ollama if you specifically need GGUF.
-
-### Recently fixed
-
-- **2026-04-27 (full-matrix re-bench + substrate unification)** — discovered and fixed four real compose drift bugs during a complete re-bench cycle:
-  - **Image split**: composes had drifted across two different vLLM image pins (`@sha256:9bba4628a3...` = `dev21` for default/tools-text/longctx/eager; `:nightly-100c7b65...` = `dev174` for v714/minimal). All six unified to `vllm/vllm-openai:nightly-07351e0883470724dd5a7e9730ed10e01fc99d08` (= `dev205+g07351e088`, Sandermage's documented reference target).
-  - **`eager.yml` config drift**: shipped with `gpu-memory-utilization=0.92` and `max-model-len=131072` while [@ampersandru](https://github.com/ampersandru)'s actual measurement was `0.97` + `125000`. As-shipped failed to boot at 131K (KV-OOM). Compose deleted entirely — see "Removed: eager.yml" above.
-  - **`v714.yml` mount path**: `patch_tolist_cudagraph.py` was mounted from `../patches/genesis/patch_tolist_cudagraph.py` but the file is at `../patches/patch_tolist_cudagraph.py`. Docker silently created an empty directory at the bogus path, breaking the patcher. Fixed.
-  - **Bench harness regression**: commit `a381086` rewrote `scripts/bench.sh` to add streaming TTFT / CV / decode_TPS instrumentation but silently dropped the original code-prompt arm (3 narrative + 2 code → narrative only). Restored as parallel narrative + code runs in one invocation; all README TPS claims re-measured.
-  - **Genesis exoneration**: ran an A/B between `default.yml` (with Genesis v7.54) and a fresh `no-genesis-mtp.yml` (identical config minus Genesis). Measured within run-to-run variance — Genesis is performance-neutral on this path, not the cause of any TPS shift vs older claims. Cross-rig confirmed by [u/sudeposutemizligi](https://www.reddit.com/r/LocalLLaMA/) on TP=2 + dev45 + no Genesis (55 narrative / 68 code, same hardware class).
-- **2026-04-27** — `docker-compose.eager.yml` initial commit incorrectly claimed "no Genesis patches needed" while still using `--kv-cache-dtype turboquant_3bit_nc`. Updated to mount Genesis P4. Compose has since been removed entirely; see above. Reported by [@walmis](https://github.com/walmis) in [#5](https://github.com/noonghunna/qwen36-27b-single-3090/issues/5).
-- **2026-04-27** — `patches/patch_tolist_cudagraph.py` was silently failing on (a) any non-docker setup (hardcoded `dist-packages` path) and (b) any vLLM nightly past the one we initially tested against (multi-line block anchors fragile against upstream rewording). Fixed in [`c34bbf1`](https://github.com/noonghunna/qwen36-27b-single-3090/commit/c34bbf1) — patcher auto-discovers vLLM via `import vllm` and uses single-line regex anchors. Bug reported by [@3dluvr](https://github.com/3dluvr) in [#1](https://github.com/noonghunna/qwen36-27b-single-3090/issues/1).
+> 📜 **Historical context** (Genesis v7.14 mechanics, the 9-probe bug isolation, upstream issue tracking, why eager.yml was removed) → [docs/INTERNALS.md](docs/INTERNALS.md)
+> 📅 **Dated change log** (recent fixes, deprecations) → [CHANGELOG.md](CHANGELOG.md)
 
 ---
 
@@ -137,6 +154,38 @@ cd .. && bash scripts/bench.sh
 ```
 
 That's it. The stack serves on `http://localhost:8020/v1/*` as a drop-in OpenAI-compatible endpoint — point any OpenAI SDK, Open WebUI, LM Studio, or Cline at it.
+
+### What success looks like
+
+If everything booted correctly, you should see in `docker logs vllm-qwen36-27b`:
+
+```
+INFO ...  Genesis Results: 27 applied, 36 skipped, 0 failed
+INFO ...  [tolist_cudagraph_fix] Patched ... Site A: ok, Site B: ok
+INFO ...  Available KV cache memory: 1.87 GiB
+INFO ...  Application startup complete.
+INFO ...  Uvicorn running on http://0.0.0.0:8000
+```
+
+A successful `curl` sanity test returns something like:
+```json
+{
+  "id": "chatcmpl-...",
+  "choices": [{
+    "message": {"role": "assistant", "content": "The capital of France is Paris."},
+    "finish_reason": "stop"
+  }],
+  "usage": {"prompt_tokens": 18, "completion_tokens": 8, "total_tokens": 26}
+}
+```
+
+`nvidia-smi` should show one process using ~21 GB of VRAM on your GPU.
+
+For a thorough check (vision, tools, streaming, thinking, long-context recall, prefill safety, MTP acceptance — 10 separate functional checks), run:
+```bash
+bash scripts/verify-full.sh
+```
+All 10 should print green checks (✓) or skips (⊘ for tests intentionally not applicable to your config). A red ✗ means something needs attention — see [Troubleshooting](#troubleshooting).
 
 ---
 
@@ -206,45 +255,15 @@ Three independent rigs, three different vLLM nightlies, with-and-without Genesis
 
 ---
 
-## Why this works where other recipes don't
+## Why this works (short version)
 
-Three hurdles had to be cleared for this config to run on a single consumer 24 GB card:
+Three hurdles had to be cleared to run a 27 B model with vision + tools + spec-decode on one 24 GB card:
 
-### 1. The published int4-AutoRound quant preserves `mtp.fc` at full precision
+1. **The INT4 quant preserves `mtp.fc` at full precision.** A vanilla AutoRound run quantizes the MTP fusion layer as INT4, which vLLM's loader silently skips → 0% draft acceptance. Lorbus's quant ships it as BF16 instead.
+2. **Genesis patches bypass the TurboQuant hybrid gate.** Qwen3-Next is hybrid (DeltaNet + attention layers); vLLM's TurboQuant KV refuses to initialize on hybrid models. Sandermage's runtime monkey-patcher rewrites the boundary protection to skip non-attention layers.
+3. **Our `patch_tolist_cudagraph.py` fixes a CUDA graph crash.** A `.tolist()` GPU→CPU sync in the continuation-prefill branch is illegal during graph capture. We disk-edit two `.tolist()` sites to skip the sync during capture only.
 
-A vanilla `auto-round` run on Qwen3.6-27B packs the MTP fusion layer (`mtp.fc`) as INT4. In that form, vLLM's `Qwen3_5MTP` loader silently skips loading it (param name mismatch: expects `fc.weight`, finds `fc.qweight`). Result: MTP "loads" with zero parameters and produces **0% draft acceptance**.
-
-Both [`Lorbus/Qwen3.6-27B-int4-AutoRound`](https://huggingface.co/Lorbus/Qwen3.6-27B-int4-AutoRound) and [`Intel/Qwen3.6-27B-int4-AutoRound`](https://huggingface.co/Intel/Qwen3.6-27B-int4-AutoRound) work around this — they ship `mtp.fc.weight` as a plain unquantized BF16 tensor. Lorbus does it implicitly (the `.weight` tensor is in the file with no explicit `extra_config` entry); Intel adds an explicit `mtp.fc: {bits: 16, data_type: fp}` to `extra_config`. Functionally identical: same 18 GB on disk, same 2013 tensors, same architecture, same INT4/group_size=128/auto_round packing. We use Lorbus because it's what we tested end-to-end; Intel's variant should be a drop-in if you prefer that source.
-
-Quick check that whichever quant you use has the fix: look for `mtp.fc.weight` (not `mtp.fc.qweight`) in the safetensors index.
-
-### 2. Genesis patches bypass the TurboQuant hybrid gate
-
-`Qwen3.6-27B` is a Qwen3-Next hybrid model: interleaved DeltaNet (Gated Linear Attention) + standard attention layers. vLLM's TurboQuant KV cache refuses to initialize on hybrid models:
-
-```
-NotImplementedError: TurboQuant KV cache is not supported for hybrid
-(attention + Mamba) models. Boundary layer protection requires uniform
-attention layers.
-```
-
-[Sandermage's Genesis patches](https://github.com/Sandermage/genesis-vllm-patches) are a 20-patch runtime monkey-patcher that, among other things, rewrites the hybrid gate to compute boundary protection only over attention layers. Works on Ampere SM 80–86.
-
-### 3. Our `patch_tolist_cudagraph.py` fixes CUDA graph capture
-
-Even with the hybrid gate bypassed, vLLM still crashed during engine warmup:
-
-```
-turboquant_attn.py:570  qsl = query_start_loc.tolist()
-RuntimeError: Cannot copy between CPU and CUDA tensors during CUDA graph
-capture unless the CPU tensor is pinned.
-```
-
-The continuation-prefill branch of `_prefill_attention` forces a GPU→CPU sync via `.tolist()`, which is illegal during CUDA graph capture. This trips when `--speculative-config` + `--enable-chunked-prefill` + `turboquant_*` KV are combined (vLLM PR #40092 — merged 2026-04-23 — fixed the fast path but left this continuation branch untouched).
-
-Our patch (`patches/patch_tolist_cudagraph.py`) is a disk-edit that wraps both `.tolist()` sites with `torch.cuda.is_current_stream_capturing()` guards. During capture, fall back to the graph-safe fast path; at inference, run the original slow path unchanged. Safe because `unified_attention_with_output` is in vLLM V1's `splitting_ops` list — attention outputs during capture are only consulted for memory profiling, not graph content.
-
-Without this patch, the documented workaround is `--compilation-config.cudagraph_mode=none`, which costs **−55% short-prompt TPS** and makes the whole setup net-negative vs plain fp8 KV.
+> 🔬 **Full mechanics** (parameter names, error traces, why each fix works, what it would take upstream) → [docs/INTERNALS.md](docs/INTERNALS.md#why-this-works-where-other-recipes-dont)
 
 ---
 
@@ -359,43 +378,6 @@ Measured on 1× RTX 3090 at 230W cap, vLLM image pinned to tested digest, `scrip
 
 ---
 
-## Technical background — what's broken upstream and why we work around it
-
-**TurboQuant KV is frontier-level.** It landed in vLLM mainline only weeks before this repo was published and is still under active development. The spec-decode × TurboQuant interaction we hit is one of several compatibility edges upstream is still working through (see vLLM's tracking issue [#40069](https://github.com/vllm-project/vllm/issues/40069) — "Speculative decoding / Eagle" and "Hybrid attention models" both unchecked).
-
-Initial symptom: under the originally-shipped 125K config (TurboQuant KV + MTP spec-decode + cudagraph on), the model produces degenerate token loops on tool calls, long-context recall, and occasionally streaming. We isolated the bug through nine probes:
-
-| # | turboquant | spec-dec | cudagraph | torch.compile | result | TPS |
-|---|---|---|---|---|---|---|
-| 1 | ✅ | off | ✅ | ✅ | ✅ all tests pass | 40 |
-| 2 | ✅ | ngram n=3 | ✅ | ✅ | ✗ same loops as MTP | -- |
-| 3 (MiMo dense) | ✅ | MTP n=1 | ✅ | ✅ | ✗ first-token collapse | -- |
-| 4 | ✅ | MTP n=3 | ✅ | + `_CONTINUATION_DECODE_THRESHOLD=0` | ✗ | -- |
-| 5 | ✅ | MTP n=3 | ❌ | ❌ | ✅ all tests pass | 23 |
-| **6** | ✅ | MTP n=3 | **❌** | ✅ | **✅ all tests pass** | **33** |
-| 7 | ✅ | MTP n=3 (9-prompt structured-output sweep) | ❌ | ✅ | ✅ all 9 prompts pass | 33 |
-| 8 | ✅ | MTP n=3 + PR #40798 backport | ✅ | ✅ | ✗ same loops | 96 |
-| **9A** | ✅ | MTP n=3 + Genesis v7.13 (#40738 + parser fixes) | ✅ | ✅ | ✗ tool calls fail, recall truncates | -- |
-| **9C** | ✅ | ngram n=3 + `prompt_lookup_min=8` + Genesis v7.13 | ✅ | ✅ | ✅ short-ctx clean (filed as cross-confirmation of #40875) | 35 |
-
-**What this isolates:**
-
-- Probe 1 → TurboQuant alone is fine.
-- Probes 2-3 → bug isn't MTP-specific; isn't hybrid-attention-specific.
-- Probe 4 → bug isn't in the within-batch `_prefill_attention` decode-fast-path routing (paper-backed bias-compounding hypothesis was wrong).
-- Probe 5 → disabling **both** torch.compile and cudagraph fixes the bug — compilation machinery is the culprit.
-- Probe 6 → disabling **only** cudagraph (keeping torch.compile inductor on) also fixes the bug — **isolating the bug to CUDA graph capture/replay specifically**.
-- Probe 7 → confirmed against [Sander's 9-prompt corruption-detection suite](https://github.com/vllm-project/vllm/issues/40831#issuecomment-4317214311) (`tool_call_simple`, `code_quicksort`, `structured_xml`, etc.) — all clean.
-- Probe 8 → backported PR #40798 (workspace-manager refactor). Bug persists. Buffer-pointer-drift hypothesis was insufficient.
-- **Probe 9A → Sander's v7.13 backports (#40738 + parser fixes) do NOT fix MTP × TurboQuant × cudagraph on Qwen3.6-27B.** Filed as [#40880](https://github.com/vllm-project/vllm/issues/40880) — explicitly per Sander's handoff that the v7.13 cycle didn't test MTP at all.
-- **Probe 9C → ngram + `prompt_lookup_min=8` + v7.13 backports DO work** at short context (cross-rig + cross-model confirmation of [#40875](https://github.com/vllm-project/vllm/issues/40875)). At ~30K context the stack OOMs due to v7.13's expanded prealloc footprint on a 24 GB card.
-
-**The Triton kernels are correct when invoked dynamically. torch.compile inductor output is correct.** What corrupts the output is how the captured CUDA graph handles spec-decode's runtime shapes vs warmup-shape capture for the TurboQuant attention path. The ngram path is fixed upstream; the MTP path remains open and is what `cudagraph_mode=NONE` works around.
-
-The 125K compose ships `--compilation-config '{"cudagraph_mode":"NONE"}'` as the interim workaround. Cost: ~60% TPS (85 → 33 narrative). Drop the flag once [#40880](https://github.com/vllm-project/vllm/issues/40880) lands.
-
----
-
 ## Troubleshooting
 
 ### `Cannot copy between CPU and CUDA tensors during CUDA graph capture`
@@ -489,18 +471,43 @@ qwen36-27b-single-3090/
 
 ---
 
-## Upstream status
+## Upstream status (summary)
 
-- **[#40069](https://github.com/vllm-project/vllm/issues/40069)** — TurboQuant/HIGGS follow-ups tracker (upstream). Lists "Speculative decoding / Eagle" and "Hybrid attention models" as unchecked.
-- **[#40807](https://github.com/vllm-project/vllm/issues/40807)** — our CUDA graph `.tolist()` crash; worked around locally via `patch_tolist_cudagraph.py`. Sandermage's [v7.10 Genesis tree](https://github.com/Sandermage/genesis-vllm-patches) reaches the same end state via pre-allocation (Patches 23 + 44).
-- **[#40831](https://github.com/vllm-project/vllm/issues/40831)** — our TurboQuant × spec-decode output-quality bug. **Closed for the ngram path** via Sander's v7.13 backports of upstream PRs (#40738 GDN state recovery + #36138 + #40783 + #39055) plus the [#40875](https://github.com/vllm-project/vllm/issues/40875) `prompt_lookup_min=8` config trick. **MTP path remains broken** — tracked at [#40880](https://github.com/vllm-project/vllm/issues/40880) (see below).
-- **[#40875](https://github.com/vllm-project/vllm/issues/40875)** — Sander's follow-up identifying that `prompt_lookup_min=2` (default) causes ngram to find spurious matches in chat-template tool definitions. Setting `prompt_lookup_min=8` is a config-only fix, validated on Sander's 35B-A3B and confirmed on our 27B (probe 9 Test C). For ngram users, this + v7.13 backports = working stack with cudagraph ON.
-- **[#40880](https://github.com/vllm-project/vllm/issues/40880)** — our MTP-specific follow-up filed at Sander's [explicit handoff](https://github.com/vllm-project/vllm/issues/40831#issuecomment-4319965017): *"we did not test MTP at all in the v7.13 cycle... your data shows that assumption is wrong."* MTP × TurboQuant × cudagraph remains broken even with all v7.13 backports applied (probe 9 Test A); the four upstream PRs scope to ngram's GDN state recovery and don't cover the Eagle/MTP forward path. **Our `cudagraph_mode=NONE` workaround in `docker-compose.longctx-experimental.yml` stays in place until this lands.**
-- **[PR #40798](https://github.com/vllm-project/vllm/pull/40798)** — *hypothesized fix that didn't pan out.* Moves `_tq_mid_o_buf` / `_tq_output_buf` / `_tq_lse_buf` from per-layer `register_buffer(B=max_num_seqs)` to `WorkspaceManager.get_simultaneous()`. Sander and I both expected this would close the pointer-drift between warmup-shape capture and runtime-shape replay. Probe 8 backported the full PR diff via [`patches/patch_pr40798_workspace.py`](./patches/patch_pr40798_workspace.py) (research artifact, not shipped) and the bug persisted. Useful negative result documented on the PR thread.
-- **Sandermage's [P56](https://github.com/Sandermage/genesis-vllm-patches/blob/main/vllm/_genesis/wiring/patch_56_spec_decode_decode_path_guard.py)** — routing-layer workaround (architecturally equivalent to our Probe 4 patch). Marked superseded by our `cudagraph_mode=NONE` workaround since it only addresses the catastrophic surface.
-- Sandermage Genesis: we may contribute `patch_tolist_cudagraph.py` to their unified script. They have offered to extract Patches 23 + 44 to upstream.
+The bugs we hit are at various stages of being fixed upstream:
 
-Until upstream lands a fix: fp8_e5m2 + MTP at 20K (default) is the fast option, cudagraph-off + turboquant + MTP at 125K (long-ctx variant) is the long-context option. Both fully functional. The cudagraph-off variant pays a ~60% TPS cost; that recovers when the underlying bug is fixed.
+| Issue | Status | Notes |
+|---|---|---|
+| [vllm#40807](https://github.com/vllm-project/vllm/issues/40807) | Worked around locally | CUDA graph `.tolist()` crash. Our `patch_tolist_cudagraph.py` ships the fix. |
+| [vllm#40831](https://github.com/vllm-project/vllm/issues/40831) | Closed (ngram + MTP) | TurboQuant × spec-decode corruption. Ngram via [#40875](https://github.com/vllm-project/vllm/issues/40875) `prompt_lookup_min=8`; MTP via Genesis v7.14 P65. |
+| [vllm#40880](https://github.com/vllm-project/vllm/issues/40880) | Worked around (Genesis v7.14) | MTP × TurboQuant × cudagraph. P65 PIECEWISE downgrade. Proper P67 multi-query Triton kernel TBD. |
+
+> 🔬 **Full upstream tracking** (each PR's mechanics, what it does/doesn't fix, why) → [docs/INTERNALS.md#upstream-status](docs/INTERNALS.md#upstream-status)
+
+---
+
+## Glossary
+
+Quick definitions of terms used throughout this README. If you've used local LLMs before, skip this section.
+
+| Term | What it means |
+|---|---|
+| **TPS** | Tokens per second — how fast the model generates output. ~70 TPS is roughly conversational speed; ChatGPT cloud is ~80-120. |
+| **Prefill** | The phase where the model processes the entire input (system prompt + user message + history) before generating the first output token. Slow on the first request, fast on follow-ups (prefix cache). |
+| **Decode** | The phase after prefill — generating output tokens one at a time. This is what TPS usually measures. |
+| **TTFT** | Time to first token — how long after sending a request before the first output arrives. Dominated by prefill cost on long prompts. |
+| **KV cache** | "Key-value" cache — the model's working memory of the conversation so far. Larger context = bigger KV cache = more VRAM. |
+| **Quantization** | Compressing model weights from 16-bit floats to 4-bit or 8-bit ints. Lets a 27 B model fit in 18 GB instead of 54 GB, with small quality loss. |
+| **vLLM** | The inference engine we run the model through. Open source, GPU-optimized; powers many cloud inference services. |
+| **MTP / spec-decode** | Multi-Token Prediction / speculative decoding. The model predicts several tokens ahead, then verifies. Roughly 2–3× faster than greedy decoding when accept rate is high. |
+| **AL (acceptance length)** | Average number of tokens accepted per spec-decode step. AL 3.5 means the model usually gets 3–4 tokens right per round. Higher is better; the theoretical max for n=3 is 4. |
+| **TurboQuant** | A 3-bit KV cache compression scheme. Lets us fit 192K+ context where fp8 KV would only fit 32K. |
+| **GDN / DeltaNet** | Gated DeltaNet — a linear-attention layer type. Qwen3-Next interleaves these with full attention layers (3 GDN per 1 attention). Has memory quirks at long context. |
+| **Genesis patches** | Sandermage's monkey-patch tree for vLLM that fixes several Qwen3-Next bugs at runtime. We mount them; vLLM applies them at boot. |
+| **Cudagraph** | A CUDA optimization that records GPU operation sequences and replays them. Faster than dispatching each op individually, but trickier to debug. |
+| **OpenAI API** | The HTTP API spec (`/v1/chat/completions`, `/v1/models`, etc.) used by ChatGPT, Claude (via proxy), and dozens of OSS chat tools. We serve this on `localhost:8020`. |
+| **Tool calling** | The model emits structured calls to external functions (e.g., `get_weather("San Francisco")`); your code runs them and feeds the result back. |
+| **Vision** | The model can accept images alongside text (multimodal). Powered by an integrated vision tower, no separate model needed. |
+| **Reasoning / thinking mode** | The model emits intermediate reasoning steps before its final answer. Like "show your work." Turned off by default; opt in with `chat_template_kwargs.enable_thinking=true`. |
 
 ---
 
